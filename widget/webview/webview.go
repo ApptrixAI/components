@@ -31,6 +31,8 @@ func NewWebView(w fyne.Window) (web WebView, err error) {
 		switch c := ctx.(type) {
 		case driver.MacWindowContext:
 			web = newWebView(c.NSWindow)
+		case driver.X11WindowContext:
+			web = newWebView(c.WindowHandle)
 		default:
 			err = fmt.Errorf("unexpected context type: %T\n", ctx)
 		}
