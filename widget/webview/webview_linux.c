@@ -59,6 +59,13 @@ static int             _frameH      = 0;
 static int             _frameStride = 0;
 static int             _frameReady  = 0;
 
+/* Minimum interval between frame copies (microseconds).
+   Frames arriving faster than this are returned to WPE immediately
+   without the expensive GBM import / pixel copy. */
+#define FRAME_MIN_INTERVAL_US (1000000 / 60)   /* ~60 fps */
+
+static int64_t _lastFrameTimeUs = 0;
+
 /* ── render_buffer vtable override ──────────────────────────────────── */
 
 static gboolean our_render_buffer(WPEView            *view,
@@ -69,12 +76,22 @@ static gboolean our_render_buffer(WPEView            *view,
 {
     (void)rects; (void)n_rects; (void)error;
 
+    /* Rate-limit: skip the expensive pixel copy if we produced a frame
+       recently.  Always release the buffer immediately so WPE can
+       reuse it — holding buffers forces the web process to allocate
+       new ones, causing unbounded memory growth. */
+    int64_t now = g_get_monotonic_time();
+    if (now - _lastFrameTimeUs < FRAME_MIN_INTERVAL_US) {
+        wpe_view_buffer_rendered(view, buffer);
+        return TRUE;
+    }
+
     int           w      = wpe_buffer_get_width(buffer);
     int           h      = wpe_buffer_get_height(buffer);
     const uint8_t *pixels = NULL;
     int           stride  = 0;
     gsize         size    = 0;
-    GBytes       *bytes   = NULL;   /* only set for SHM (needs unref) */
+    GBytes       *bytes   = NULL;   /* only set for SHM */
 
     /* GBM mapping state for DMA-BUF path. */
     struct gbm_bo *bo       = NULL;
@@ -120,17 +137,29 @@ static gboolean our_render_buffer(WPEView            *view,
     if (pixels && w > 0 && h > 0 && stride > 0 &&
         size >= (gsize)h * (gsize)stride)
     {
+        int dst_stride = w * 4;
         pthread_mutex_lock(&_frameMu);
         if (!_frameBuf || _frameW != w || _frameH != h) {
             free(_frameBuf);
-            _frameBuf = malloc((gsize)h * (gsize)stride);
+            _frameBuf = malloc((gsize)h * (gsize)dst_stride);
         }
         if (_frameBuf) {
-            memcpy(_frameBuf, pixels, (gsize)h * (gsize)stride);
+            /* BGRA → RGBA swizzle during copy so Go can memcpy directly. */
+            for (int y = 0; y < h; y++) {
+                const uint8_t *src_row = pixels + y * stride;
+                uint8_t       *dst_row = _frameBuf + y * dst_stride;
+                for (int x = 0; x < w; x++) {
+                    dst_row[x*4+0] = src_row[x*4+2]; /* R */
+                    dst_row[x*4+1] = src_row[x*4+1]; /* G */
+                    dst_row[x*4+2] = src_row[x*4+0]; /* B */
+                    dst_row[x*4+3] = 255;             /* A — force opaque */
+                }
+            }
             _frameW      = w;
             _frameH      = h;
-            _frameStride = stride;
+            _frameStride = dst_stride;
             _frameReady  = 1;
+            _lastFrameTimeUs = now;
         }
         pthread_mutex_unlock(&_frameMu);
     }
@@ -139,7 +168,6 @@ static gboolean our_render_buffer(WPEView            *view,
         if (map_data) gbm_bo_unmap(bo, map_data);
         gbm_bo_destroy(bo);
     }
-    if (bytes) g_bytes_unref(bytes);
 
     wpe_view_buffer_rendered(view, buffer);
     goFrameReady();
@@ -235,8 +263,23 @@ int WebView_Create(int width, int height)
     /* Make this the primary display so webkit_web_view_new(NULL) picks it up. */
     wpe_display_set_primary(_display);
 
+    /* Disable GPU-accelerated rendering.  In headless mode we copy every
+       frame into a CPU pixel buffer anyway; letting the web process use
+       the GPU causes it to allocate DMA-BUF / GPU buffers that are not
+       reclaimed fast enough, leading to unbounded memory growth in
+       WPEWebProcess.
+       The enum value 2 == WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER
+       (the convenience function and enum are not exposed in WPE headers). */
+    WebKitSettings *settings = webkit_settings_new();
+    g_object_set(G_OBJECT(settings),
+                 "hardware-acceleration-policy", 2, NULL);
+
     /* Create the WebKitWebView using the primary (headless) display. */
-    _webView = g_object_ref_sink(webkit_web_view_new(NULL));
+    _webView = g_object_ref_sink(
+        WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
+                                     "settings", settings,
+                                     NULL)));
+    g_object_unref(settings);
     if (!_webView) {
         fprintf(stderr, "webview_linux: webkit_web_view_new() failed\n");
         return 0;
@@ -485,6 +528,7 @@ const uint8_t *WebView_LockFrame(int *out_w, int *out_h, int *out_stride)
         pthread_mutex_unlock(&_frameMu);
         return NULL;
     }
+    _frameReady = 0;    /* mark consumed so we don't re-copy unchanged frames */
     *out_w      = _frameW;
     *out_h      = _frameH;
     *out_stride = _frameStride;

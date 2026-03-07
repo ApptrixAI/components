@@ -65,7 +65,7 @@ func newWebView(handle uintptr) *webView {
 
 		// Pump the GLib main context once per frame on the Fyne run loop.
 		go func() {
-			ticker := time.NewTicker(time.Second / 120)
+			ticker := time.NewTicker(time.Second / 60)
 			defer ticker.Stop()
 			for range ticker.C {
 				fyne.Do(func() { C.WebView_IterateLoop() })
@@ -74,9 +74,16 @@ func newWebView(handle uintptr) *webView {
 
 		// Frame-ready goroutine: copies pixels then refreshes the raster.
 		go func() {
+			minInterval := time.Second / 60
+			lastRefresh := time.Time{}
 			for range globalFrameCh {
+				now := time.Now()
+				if now.Sub(lastRefresh) < minInterval {
+					continue
+				}
 				w.copyFrame()
 				if w.raster != nil {
+					lastRefresh = time.Now()
 					w.raster.Refresh()
 				}
 			}
@@ -101,7 +108,8 @@ func (w *webView) generateFrame(rw, rh int) image.Image {
 	return image.NewNRGBA(image.Rect(0, 0, rw, rh))
 }
 
-// copyFrame reads the latest pixels from the C buffer and stores an NRGBA image.
+// copyFrame reads the latest RGBA pixels from the C buffer and stores an NRGBA image.
+// The C side already performs the BGRA→RGBA swizzle, so this is a straight copy.
 func (w *webView) copyFrame() {
 	var cw, ch, cstride C.int
 	ptr := C.WebView_LockFrame(&cw, &ch, &cstride)
@@ -112,23 +120,16 @@ func (w *webView) copyFrame() {
 
 	width := int(cw)
 	height := int(ch)
-	stride := int(cstride)
+	nbytes := width * height * 4
 
-	nrgba := image.NewNRGBA(image.Rect(0, 0, width, height))
-	src := unsafe.Slice((*uint8)(unsafe.Pointer(ptr)), height*stride)
-
-	// WPE_PIXEL_FORMAT_ARGB8888: on little-endian, each 32-bit word stored
-	// as [B, G, R, A] bytes.  NRGBA expects [R, G, B, A].
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			si := y*stride + x*4
-			di := (y*width + x) * 4
-			nrgba.Pix[di+0] = src[si+2] // R
-			nrgba.Pix[di+1] = src[si+1] // G
-			nrgba.Pix[di+2] = src[si+0] // B
-			nrgba.Pix[di+3] = 255       // A — force opaque; WPE headless leaves alpha at 0
-		}
+	// Reuse the existing buffer if the dimensions haven't changed.
+	nrgba := w.framePtr.Load()
+	if nrgba == nil || nrgba.Rect.Dx() != width || nrgba.Rect.Dy() != height {
+		nrgba = image.NewNRGBA(image.Rect(0, 0, width, height))
 	}
+
+	src := unsafe.Slice((*uint8)(unsafe.Pointer(ptr)), nbytes)
+	copy(nrgba.Pix, src)
 
 	w.framePtr.Store(nrgba)
 }
