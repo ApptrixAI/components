@@ -33,6 +33,16 @@ void WebView_SetFrame(double x, double y, double width, double height) {
     [_webView setFrame:frame];
 }
 
+void WebView_SetDarkMode(int dark) {
+    if (_webView == nil) return;
+
+    if (dark) {
+        _webView.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    } else {
+        _webView.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+    }
+}
+
 void WebView_Navigate(const char *url) {
     if (url == NULL) return;
     NSString *urlString = [NSString stringWithUTF8String:url];

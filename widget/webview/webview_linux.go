@@ -18,6 +18,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -50,6 +51,15 @@ func newWebView(handle uintptr) *webView {
 
 	if C.WebView_Create(800, 600) != 0 {
 		w.created = true
+		w.syncTheme()
+
+		ch := make(chan fyne.Settings)
+		fyne.CurrentApp().Settings().AddChangeListener(ch)
+		go func() {
+			for range ch {
+				fyne.Do(w.syncTheme)
+			}
+		}()
 
 		w.raster = canvas.NewRaster(w.generateFrame)
 
@@ -73,6 +83,14 @@ func newWebView(handle uintptr) *webView {
 		}()
 	}
 	return w
+}
+
+func (w *webView) syncTheme() {
+	dark := 0
+	if fyne.CurrentApp().Settings().ThemeVariant() == theme.VariantDark {
+		dark = 1
+	}
+	C.WebView_SetDarkMode(C.int(dark))
 }
 
 // generateFrame is called by canvas.Raster on the GUI thread each repaint.

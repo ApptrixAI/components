@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -24,7 +25,25 @@ func newWebView(nsWindow uintptr) *webView {
 	C.WebView_Create(unsafe.Pointer(nsWindow))
 	w := &webView{created: true}
 	w.ExtendBaseWidget(w)
+	w.syncTheme()
+
+	ch := make(chan fyne.Settings)
+	fyne.CurrentApp().Settings().AddChangeListener(ch)
+	go func() {
+		for range ch {
+			fyne.Do(w.syncTheme)
+		}
+	}()
+
 	return w
+}
+
+func (w *webView) syncTheme() {
+	dark := 0
+	if fyne.CurrentApp().Settings().ThemeVariant() == theme.VariantDark {
+		dark = 1
+	}
+	C.WebView_SetDarkMode(C.int(dark))
 }
 
 func (w *webView) CreateRenderer() fyne.WidgetRenderer {

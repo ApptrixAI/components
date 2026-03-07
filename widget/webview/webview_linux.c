@@ -316,6 +316,25 @@ void WebView_SetScale(double scale)
     }
 }
 
+static gboolean idle_set_dark_mode(gpointer data)
+{
+    gboolean dark = GPOINTER_TO_INT(data);
+    WPEDisplay *d = _display;
+    if (!d) d = wpe_display_get_primary();
+    if (d) {
+        WPESettings *settings = wpe_display_get_settings(d);
+        if (settings)
+            wpe_settings_set_boolean(settings, WPE_SETTING_DARK_MODE, dark,
+                                     WPE_SETTINGS_SOURCE_APPLICATION, NULL);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+void WebView_SetDarkMode(int dark)
+{
+    g_idle_add(idle_set_dark_mode, GINT_TO_POINTER(dark));
+}
+
 void WebView_Navigate(const char *url)
 {
     if (url)

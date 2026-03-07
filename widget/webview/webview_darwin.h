@@ -5,6 +5,7 @@
 
 void WebView_Create(void *nsWindow);
 void WebView_SetFrame(double x, double y, double width, double height);
+void WebView_SetDarkMode(int dark);
 void WebView_Navigate(const char *url);
 void WebView_GoBack(void);
 void WebView_GoForward(void);

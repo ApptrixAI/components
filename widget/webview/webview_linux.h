@@ -24,6 +24,9 @@ void        WebView_GoForward(void);
 void        WebView_Reload   (void);
 void        WebView_Stop     (void);
 
+/* Appearance */
+void        WebView_SetDarkMode(int dark);
+
 /* State queries (thread-safe reads of GObject properties) */
 int         WebView_IsLoading(void);
 const char *WebView_GetURL   (void);
