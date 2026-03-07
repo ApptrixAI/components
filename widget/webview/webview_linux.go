@@ -11,6 +11,7 @@ import "C"
 import (
 	"image"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -22,36 +23,42 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-/* ── frame notification channel ────────────────────────────────────── */
-
-var globalFrameCh = make(chan struct{}, 1)
+var (
+	viewsMu sync.Mutex
+	views   []*webView
+)
 
 //export goFrameReady
 func goFrameReady() {
-	select {
-	case globalFrameCh <- struct{}{}:
-	default:
+	viewsMu.Lock()
+	defer viewsMu.Unlock()
+	for _, w := range views {
+		select {
+		case w.frameCh <- struct{}{}:
+		default:
+		}
 	}
 }
-
-/* ── webView widget ─────────────────────────────────────────────────── */
 
 type webView struct {
 	widget.BaseWidget
 	created  bool
 	raster   *canvas.Raster
 	framePtr atomic.Pointer[image.NRGBA]
+	frameCh  chan struct{}
 }
 
-func newWebView(handle uintptr) *webView {
-	_ = handle // headless backend; no native window handle needed
-
-	w := &webView{}
+func newWebView(_ uintptr) *webView {
+	w := &webView{frameCh: make(chan struct{}, 1)}
 	w.ExtendBaseWidget(w)
 
 	if C.WebView_Create(800, 600) != 0 {
 		w.created = true
 		w.syncTheme()
+
+		viewsMu.Lock()
+		views = append(views, w)
+		viewsMu.Unlock()
 
 		ch := make(chan fyne.Settings)
 		fyne.CurrentApp().Settings().AddChangeListener(ch)
@@ -76,7 +83,7 @@ func newWebView(handle uintptr) *webView {
 		go func() {
 			minInterval := time.Second / 60
 			lastRefresh := time.Time{}
-			for range globalFrameCh {
+			for range w.frameCh {
 				now := time.Now()
 				if now.Sub(lastRefresh) < minInterval {
 					continue
