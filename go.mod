@@ -1,4 +1,4 @@
-module apptrix.ai/components
+module apptrix.org/components
 
 go 1.19
 
