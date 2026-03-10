@@ -48,7 +48,7 @@ type webView struct {
 	frameCh  chan struct{}
 }
 
-func newWebView(_ uintptr) *webView {
+func newWebView(_ fyne.Window) *webView {
 	w := &webView{frameCh: make(chan struct{}, 1)}
 	w.ExtendBaseWidget(w)
 

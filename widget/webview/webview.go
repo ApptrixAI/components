@@ -28,13 +28,13 @@ func NewWebView(w fyne.Window) (web WebView, err error) {
 	}
 
 	nw.RunNative(func(ctx any) {
-		switch c := ctx.(type) {
+		switch ctx.(type) {
 		case driver.MacWindowContext:
-			web = newWebView(c.NSWindow)
+			web = newWebView(w)
 		case driver.WindowsWindowContext:
-			web = newWebView(c.HWND)
+			web = newWebView(w)
 		case driver.X11WindowContext:
-			web = newWebView(c.WindowHandle)
+			web = newWebView(w)
 		default:
 			err = fmt.Errorf("unexpected context type: %T\n", ctx)
 		}

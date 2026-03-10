@@ -21,9 +21,22 @@ type webView struct {
 	created bool
 }
 
-func newWebView(hwnd uintptr) *webView {
-	C.WebView_Create(unsafe.Pointer(hwnd))
-	w := &webView{created: true}
+func newWebView(win fyne.Window) *webView {
+	w := &webView{}
+
+	w.untilCreated(func() {
+		win.(driver.NativeWindow).RunNative(func(ctx any) {
+			handle := ctx.(driver.WindowsWindowContext).HWND
+			if handle == 0 {
+				return
+			}
+
+			C.WebView_Create(unsafe.Pointer(handle))
+			w.updateFrame()
+			w.created = true
+		})
+	})
+
 	w.ExtendBaseWidget(w)
 	w.syncTheme()
 
@@ -90,13 +103,15 @@ func (w *webView) FocusLost() {
 	C.WebView_Unfocus()
 }
 
-func (w *webView) TypedRune(rune)        {}
+func (w *webView) TypedRune(rune)          {}
 func (w *webView) TypedKey(*fyne.KeyEvent) {}
 
 func (w *webView) Load(url *url.URL) {
-	cs := C.CString(url.String())
-	defer C.free(unsafe.Pointer(cs))
-	C.WebView_Navigate(cs)
+	w.afterCreated(func() {
+		cs := C.CString(url.String())
+		defer C.free(unsafe.Pointer(cs))
+		C.WebView_Navigate(cs)
+	})
 }
 
 func (w *webView) Back() {

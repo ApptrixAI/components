@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/driver"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
@@ -21,9 +22,20 @@ type webView struct {
 	created bool
 }
 
-func newWebView(nsWindow uintptr) *webView {
-	C.WebView_Create(unsafe.Pointer(nsWindow))
-	w := &webView{created: true}
+func newWebView(win fyne.Window) *webView {
+	w := &webView{}
+	w.untilCreated(func() {
+		win.(driver.NativeWindow).RunNative(func(ctx any) {
+			nswin := ctx.(driver.MacWindowContext).NSWindow
+			if nswin == 0 {
+				return
+			}
+
+			C.WebView_Create(unsafe.Pointer(nswin))
+			w.updateFrame()
+			w.created = true
+		})
+	})
 	w.ExtendBaseWidget(w)
 	w.syncTheme()
 
@@ -71,9 +83,11 @@ func (w *webView) updateFrame() {
 }
 
 func (w *webView) Load(url *url.URL) {
-	cs := C.CString(url.String())
-	defer C.free(unsafe.Pointer(cs))
-	C.WebView_Navigate(cs)
+	w.afterCreated(func() {
+		cs := C.CString(url.String())
+		defer C.free(unsafe.Pointer(cs))
+		C.WebView_Navigate(cs)
+	})
 }
 
 func (w *webView) Back() {
