@@ -37,8 +37,10 @@ func NewWebView(w fyne.Window) (web WebView, err error) {
 			web = newWebView(w)
 		case *driver.UnknownContext: // iOS
 			web = newWebView(w)
+		case *driver.AndroidWindowContext:
+			web = newWebView(w)
 		default:
-			err = fmt.Errorf("unexpected context type: %T\n", ctx)
+			err = fmt.Errorf("unexpected context type: %T", ctx)
 		}
 	})
 

@@ -1,3 +1,5 @@
+//go:build linux && !android
+
 #ifndef WEBVIEW_LINUX_H
 #define WEBVIEW_LINUX_H
 

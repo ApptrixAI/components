@@ -1,3 +1,5 @@
+//go:build linux && !android
+
 /*
  * webview_linux.c — WPE WebKit 2.50+ headless rendering into a pixel buffer.
  *
