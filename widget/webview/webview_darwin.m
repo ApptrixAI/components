@@ -1,3 +1,6 @@
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX
+
 #include "webview_darwin.h"
 
 #import <Cocoa/Cocoa.h>
@@ -92,3 +95,5 @@ const char* WebView_GetURL(void) {
     if (url == nil) return "";
     return [url UTF8String];
 }
+
+#endif // TARGET_OS_OSX

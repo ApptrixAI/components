@@ -1,11 +1,11 @@
-//go:build !ios
+//go:build ios
 
 package webview
 
 /*
-#cgo LDFLAGS: -framework Cocoa -framework WebKit
+#cgo LDFLAGS: -framework UIKit -framework WebKit -framework CoreGraphics
 
-#include "webview_darwin.h"
+#include "webview_ios.h"
 #include <stdlib.h>
 */
 import "C"
@@ -14,29 +14,24 @@ import (
 	"unsafe"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/driver"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
 type webView struct {
 	widget.BaseWidget
+	win     fyne.Window
 	created bool
 }
 
 func newWebView(win fyne.Window) *webView {
-	w := &webView{}
+	w := &webView{win: win}
 	w.untilCreated(func() {
-		win.(driver.NativeWindow).RunNative(func(ctx any) {
-			nswin := ctx.(driver.MacWindowContext).NSWindow
-			if nswin == 0 {
-				return
-			}
-
-			C.WebView_Create(unsafe.Pointer(nswin))
-			w.updateFrame()
-			w.created = true
-		})
+		if C.WebView_Create() == 0 {
+			return
+		}
+		w.updateFrame()
+		w.created = true
 	})
 	w.ExtendBaseWidget(w)
 	w.syncTheme()
