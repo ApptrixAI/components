@@ -116,19 +116,59 @@ void WebView_Navigate(const char *url) {
 }
 
 void WebView_GoBack(void) {
-    if (_webView != nil) [_webView goBack];
+    void (^block)(void) = ^{
+        if (_webView == nil) return;
+
+        [_webView goBack];
+    };
+
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), block);
+    }
 }
 
 void WebView_GoForward(void) {
-    if (_webView != nil) [_webView goForward];
+    void (^block)(void) = ^{
+        if (_webView == nil) return;
+
+        [_webView goForward];
+    };
+
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), block);
+    }
 }
 
 void WebView_Reload(void) {
-    if (_webView != nil) [_webView reload];
+    void (^block)(void) = ^{
+        if (_webView == nil) return;
+
+        [_webView reload];
+    };
+
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), block);
+    }
 }
 
 void WebView_Stop(void) {
-    if (_webView != nil) [_webView stopLoading];
+    void (^block)(void) = ^{
+        if (_webView == nil) return;
+
+        [_webView stopLoading];
+    };
+
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), block);
+    }
 }
 
 int WebView_IsLoading(void) {

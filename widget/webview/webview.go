@@ -2,7 +2,6 @@ package webview // import apptrix.org/components/widget/webview
 
 import (
 	"errors"
-	"fmt"
 	"net/url"
 
 	"fyne.io/fyne/v2"
@@ -22,27 +21,15 @@ type WebView interface {
 }
 
 func NewWebView(w fyne.Window) (web WebView, err error) {
-	nw, ok := w.(driver.NativeWindow)
+	_, ok := w.(driver.NativeWindow)
 	if !ok {
-		return nil, errors.New("window does not implement NativeWindow")
+		return nil, errors.New("webview requires a NativeWindow")
 	}
 
-	nw.RunNative(func(ctx any) {
-		switch ctx.(type) {
-		case driver.MacWindowContext:
-			web = newWebView(w)
-		case driver.WindowsWindowContext:
-			web = newWebView(w)
-		case driver.X11WindowContext:
-			web = newWebView(w)
-		case *driver.UnknownContext: // iOS
-			web = newWebView(w)
-		case *driver.AndroidWindowContext:
-			web = newWebView(w)
-		default:
-			err = fmt.Errorf("unexpected context type: %T", ctx)
-		}
-	})
+	web = newWebView(w)
+	if web == nil {
+		return web, errors.New("WebView is not supported on current platform")
+	}
 
 	return web, err
 }
