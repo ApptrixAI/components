@@ -5,7 +5,7 @@ import (
 )
 
 type dummyMessageSource struct {
-	msgs    []Message
+	msgs []Message
 }
 
 var dummyMessages = []Message{
