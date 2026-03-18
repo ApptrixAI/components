@@ -1,4 +1,4 @@
-package chat // import apptrix.org/components/widget/chat
+package chat
 
 import (
 	"strings"
