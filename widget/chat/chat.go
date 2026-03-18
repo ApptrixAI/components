@@ -19,7 +19,6 @@ type Chat struct {
 	list          *messageList
 	input         *input
 	submit        *widget.Button
-	paused        bool
 	maxId         int
 	inputDisabled bool
 }
@@ -66,7 +65,7 @@ func New(src MessageSource) *Chat {
 		if id > c.maxId || c.maxId >= c.list.Length() {
 			c.maxId = id
 		}
-		c.paused = id < c.maxId
+		c.list.paused = id < c.maxId
 	}
 
 	c.input = newInput(func() {
@@ -118,9 +117,6 @@ func New(src MessageSource) *Chat {
 }
 
 func (c *Chat) ScrollToBottom() {
-	if c.paused {
-		return
-	}
 	c.list.ScrollToBottom()
 }
 
