@@ -67,6 +67,9 @@ func New(src MessageSource) *Chat {
 		}
 		c.list.paused = id < c.maxId
 	}
+	c.list.OnSelected = func(id widget.ListItemID) {
+		c.list.UnselectAll()
+	}
 
 	c.input = newInput(func() {
 		if fn := c.submit.OnTapped; fn != nil {
