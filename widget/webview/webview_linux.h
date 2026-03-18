@@ -10,9 +10,9 @@
    Returns 1 on success, 0 on failure. */
 int         WebView_Create   (int width, int height);
 
-/* Pump the GLib main context once (non-blocking).  Call this every
-   frame from the Fyne run loop via fyne.Do(). */
-void        WebView_IterateLoop(void);
+/* Run the GLib main loop (blocks forever).  Call from a dedicated
+   goroutine with runtime.LockOSThread(). */
+void        WebView_RunLoop    (void);
 
 /* Resize the headless view so WPE renders at the new dimensions.
    x and y are ignored (headless has no screen position). */

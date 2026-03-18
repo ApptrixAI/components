@@ -20,7 +20,10 @@ type WebView interface {
 	CurrentURL() *url.URL
 }
 
-func NewWebView(w fyne.Window) (web WebView, err error) {
+// New returns a new WebView that uses a system library to provide an embedded web widget.
+// The window parameter is required for some platforms to draw the native component.
+// Do not move this widget to a different window once it has been created.
+func New(w fyne.Window) (web WebView, err error) {
 	_, ok := w.(driver.NativeWindow)
 	if !ok {
 		return nil, errors.New("webview requires a NativeWindow")

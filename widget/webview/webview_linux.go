@@ -13,6 +13,8 @@ import "C"
 import (
 	"image"
 	"net/url"
+	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,17 +46,39 @@ func goFrameReady() {
 
 type webView struct {
 	widget.BaseWidget
-	created  bool
-	raster   *canvas.Raster
-	framePtr atomic.Pointer[image.NRGBA]
-	frameCh  chan struct{}
+	created bool
+	img     *canvas.Image
+	// Double-buffered frames: back is written by copyFrame, then swapped to front.
+	front   atomic.Pointer[image.NRGBA]
+	back    *image.NRGBA
+	frameCh chan struct{}
 }
 
 func newWebView(_ fyne.Window) *webView {
 	w := &webView{frameCh: make(chan struct{}, 1)}
 	w.ExtendBaseWidget(w)
 
-	if C.WebView_Create(800, 600) != 0 {
+	// Move JSC's GC signal away from SIGUSR1 (signal 10) which
+	// conflicts with Go's runtime signal handlers.
+	os.Setenv("JSC_SIGNAL_FOR_GC", "42")
+
+
+
+	// Create the WebView and run the GLib main loop on the SAME
+	// locked OS thread.  GLib expects the thread that creates the
+	// default main context to be the one that iterates it;
+	// splitting them across threads causes assertion failures.
+	created := make(chan bool, 1)
+	go func() {
+		runtime.LockOSThread()
+		ok := C.WebView_Create(800, 600) != 0
+		created <- ok
+		if ok {
+			C.WebView_RunLoop() // blocks forever
+		}
+	}()
+
+	if <-created {
 		w.created = true
 		w.syncTheme()
 
@@ -70,18 +94,11 @@ func newWebView(_ fyne.Window) *webView {
 			}
 		}()
 
-		w.raster = canvas.NewRaster(w.generateFrame)
+		w.img = canvas.NewImageFromImage(image.NewNRGBA(image.Rect(0, 0, 1, 1)))
+		w.img.ScaleMode = canvas.ImageScaleSmooth
 
-		// Pump the GLib main context once per frame on the Fyne run loop.
-		go func() {
-			ticker := time.NewTicker(time.Second / 60)
-			defer ticker.Stop()
-			for range ticker.C {
-				fyne.Do(func() { C.WebView_IterateLoop() })
-			}
-		}()
-
-		// Frame-ready goroutine: copies pixels then refreshes the raster.
+		// Frame-ready goroutine: copies pixels to back buffer, swaps to
+		// front, then refreshes the image on the Fyne thread.
 		go func() {
 			minInterval := time.Second / 60
 			lastRefresh := time.Time{}
@@ -91,10 +108,13 @@ func newWebView(_ fyne.Window) *webView {
 					continue
 				}
 				w.copyFrame()
-				if w.raster != nil {
-					lastRefresh = time.Now()
-					w.raster.Refresh()
-				}
+				lastRefresh = time.Now()
+				fyne.Do(func() {
+					if f := w.front.Load(); f != nil {
+						w.img.Image = f
+						w.img.Refresh()
+					}
+				})
 			}
 		}()
 	}
@@ -109,15 +129,8 @@ func (w *webView) syncTheme() {
 	C.WebView_SetDarkMode(C.int(dark))
 }
 
-// generateFrame is called by canvas.Raster on the GUI thread each repaint.
-func (w *webView) generateFrame(rw, rh int) image.Image {
-	if f := w.framePtr.Load(); f != nil {
-		return f
-	}
-	return image.NewNRGBA(image.Rect(0, 0, rw, rh))
-}
-
-// copyFrame reads the latest RGBA pixels from the C buffer and stores an NRGBA image.
+// copyFrame reads the latest RGBA pixels from the C buffer into the back
+// buffer, then promotes it to front so the Fyne image can display it.
 // The C side already performs the BGRA→RGBA swizzle, so this is a straight copy.
 func (w *webView) copyFrame() {
 	var cw, ch, cstride C.int
@@ -131,16 +144,21 @@ func (w *webView) copyFrame() {
 	height := int(ch)
 	nbytes := width * height * 4
 
-	// Reuse the existing buffer if the dimensions haven't changed.
-	nrgba := w.framePtr.Load()
-	if nrgba == nil || nrgba.Rect.Dx() != width || nrgba.Rect.Dy() != height {
-		nrgba = image.NewNRGBA(image.Rect(0, 0, width, height))
+	// Reuse the back buffer if the dimensions haven't changed.
+	if w.back == nil || w.back.Rect.Dx() != width || w.back.Rect.Dy() != height {
+		w.back = image.NewNRGBA(image.Rect(0, 0, width, height))
 	}
 
 	src := unsafe.Slice((*uint8)(unsafe.Pointer(ptr)), nbytes)
-	copy(nrgba.Pix, src)
+	copy(w.back.Pix, src)
 
-	w.framePtr.Store(nrgba)
+	// Swap: current back becomes front, old front becomes back for next frame.
+	old := w.front.Swap(w.back)
+	if old != nil && old.Rect.Dx() == width && old.Rect.Dy() == height {
+		w.back = old
+	} else {
+		w.back = nil // dimensions changed, discard
+	}
 }
 
 /* ── Input events ──────────────────────────────────────────────────── */
@@ -359,22 +377,22 @@ type webViewRenderer struct {
 func (r *webViewRenderer) Destroy() {}
 
 func (r *webViewRenderer) Layout(size fyne.Size) {
-	if r.view.raster != nil {
-		r.view.raster.Resize(size)
+	if r.view.img != nil {
+		r.view.img.Resize(size)
 	}
 }
 
 func (r *webViewRenderer) MinSize() fyne.Size { return fyne.NewSize(100, 100) }
 
 func (r *webViewRenderer) Objects() []fyne.CanvasObject {
-	if r.view.raster != nil {
-		return []fyne.CanvasObject{r.view.raster}
+	if r.view.img != nil {
+		return []fyne.CanvasObject{r.view.img}
 	}
 	return nil
 }
 
 func (r *webViewRenderer) Refresh() {
-	if r.view.raster != nil {
-		r.view.raster.Refresh()
+	if r.view.img != nil {
+		r.view.img.Refresh()
 	}
 }

@@ -4,13 +4,13 @@
  * webview_linux.c — WPE WebKit 2.50+ headless rendering into a pixel buffer.
  *
  * Architecture:
- *   • WPEDisplayHeadless backs the WebKit web view — no X11/Wayland/GBM needed.
+ *   • WPEDisplayHeadless backs the WebKit web view — no X11/Wayland needed.
  *   • WPE delivers each rendered frame via the render_buffer vtable slot.
- *     Buffers may be SHM or DMA-BUF depending on the system; DMA-BUF frames
- *     are imported through GBM so tiled GPU formats are handled correctly.
+ *     SHM buffers are read directly; DMA-BUF buffers are de-tiled via GBM
+ *     with an explicit workaround for Mesa's gbm_bo_map staging-fd leak.
  *   • A Go goroutine (runtime.LockOSThread) runs the GLib main loop.
  *   • goFrameReady() (exported from Go) is called after each frame copy so the
- *     Go side can refresh the canvas.Raster widget.
+ *     Go side can refresh the canvas.Image widget.
  */
 
 #include "webview_linux.h"
@@ -45,12 +45,29 @@ static WPEToplevel   *_toplevel = NULL;
 static WPEView       *_wpeView  = NULL;
 static WebKitWebView *_webView  = NULL;
 
+/* Original render_buffer vtable method — we chain to it after reading
+   pixels so that WPE's internal buffer lifecycle (recycling, fd
+   management) works correctly. */
+static gboolean (*_orig_render_buffer)(WPEView *, WPEBuffer *,
+                                       const WPERectangle *, guint,
+                                       GError **) = NULL;
+
 static int _w = 800;
 static int _h = 600;
 
-/* GBM device for importing DMA-BUF frames. */
+/* GBM device for importing DMA-BUF frames (de-tiling). */
 static int                _drmFd = -1;
 static struct gbm_device *_gbm   = NULL;
+
+/* No BO cache — each frame does a fresh import/map/copy/unmap/destroy.
+   Caching the BO causes stale frames because GBM snapshots the buffer
+   contents at import time; subsequent GPU writes to the same DMA-BUF
+   are not reflected through the cached BO.
+
+   This works without leaking because we chain to the original
+   render_buffer vtable method, which lets WPE recycle its small buffer
+   pool (~2-3 fds).  Per-frame import+destroy on a recycled fd is
+   lightweight, and gbm_bo_destroy fully cleans up the GEM handle. */
 
 /* ── Frame pixel buffer ──────────────────────────────────────────────── */
 
@@ -63,7 +80,7 @@ static int             _frameReady  = 0;
 
 /* Minimum interval between frame copies (microseconds).
    Frames arriving faster than this are returned to WPE immediately
-   without the expensive GBM import / pixel copy. */
+   without the expensive pixel copy. */
 #define FRAME_MIN_INTERVAL_US (1000000 / 60)   /* ~60 fps */
 
 static int64_t _lastFrameTimeUs = 0;
@@ -84,6 +101,9 @@ static gboolean our_render_buffer(WPEView            *view,
        new ones, causing unbounded memory growth. */
     int64_t now = g_get_monotonic_time();
     if (now - _lastFrameTimeUs < FRAME_MIN_INTERVAL_US) {
+        /* Skip pixel copy but still chain to original for buffer recycling. */
+        if (_orig_render_buffer)
+            return _orig_render_buffer(view, buffer, rects, n_rects, error);
         wpe_view_buffer_rendered(view, buffer);
         return TRUE;
     }
@@ -93,22 +113,21 @@ static gboolean our_render_buffer(WPEView            *view,
     const uint8_t *pixels = NULL;
     int           stride  = 0;
     gsize         size    = 0;
-    GBytes       *bytes   = NULL;   /* only set for SHM */
 
-    /* GBM mapping state for DMA-BUF path. */
+    /* Per-frame GBM map state (unmap after copy). */
     struct gbm_bo *bo       = NULL;
     void          *map_data = NULL;
 
     if (WPE_IS_BUFFER_SHM(buffer)) {
         WPEBufferSHM *shm = WPE_BUFFER_SHM(buffer);
-        bytes  = wpe_buffer_shm_get_data(shm);
+        GBytes *bytes  = wpe_buffer_shm_get_data(shm);
         stride = (int)wpe_buffer_shm_get_stride(shm);
         pixels = g_bytes_get_data(bytes, &size);
     } else if (WPE_IS_BUFFER_DMA_BUF(buffer) && _gbm) {
         WPEBufferDMABuf *dmabuf = WPE_BUFFER_DMA_BUF(buffer);
         guint n_planes = wpe_buffer_dma_buf_get_n_planes(dmabuf);
 
-        struct gbm_import_fd_modifier_data import = {
+        struct gbm_import_fd_modifier_data imp = {
             .width    = (uint32_t)w,
             .height   = (uint32_t)h,
             .format   = wpe_buffer_dma_buf_get_format(dmabuf),
@@ -116,13 +135,13 @@ static gboolean our_render_buffer(WPEView            *view,
             .modifier = wpe_buffer_dma_buf_get_modifier(dmabuf),
         };
         for (guint i = 0; i < n_planes && i < 4; i++) {
-            import.fds[i]     = wpe_buffer_dma_buf_get_fd(dmabuf, i);
-            import.strides[i] = (int)wpe_buffer_dma_buf_get_stride(dmabuf, i);
-            import.offsets[i] = (int)wpe_buffer_dma_buf_get_offset(dmabuf, i);
+            imp.fds[i]     = wpe_buffer_dma_buf_get_fd(dmabuf, i);
+            imp.strides[i] = (int)wpe_buffer_dma_buf_get_stride(dmabuf, i);
+            imp.offsets[i] = (int)wpe_buffer_dma_buf_get_offset(dmabuf, i);
         }
 
         bo = gbm_bo_import(_gbm, GBM_BO_IMPORT_FD_MODIFIER,
-                           &import, GBM_BO_USE_LINEAR);
+                           &imp, GBM_BO_USE_LINEAR);
         if (bo) {
             uint32_t map_stride = 0;
             void *mapped = gbm_bo_map(bo, 0, 0, (uint32_t)w, (uint32_t)h,
@@ -167,12 +186,19 @@ static gboolean our_render_buffer(WPEView            *view,
     }
 
     if (bo) {
-        if (map_data) gbm_bo_unmap(bo, map_data);
+        if (map_data)
+            gbm_bo_unmap(bo, map_data);
         gbm_bo_destroy(bo);
     }
 
-    wpe_view_buffer_rendered(view, buffer);
     goFrameReady();
+
+    /* Chain to the original WPEViewHeadless render_buffer so that WPE's
+       internal buffer pool management (recycling, fd cleanup) works.
+       Without this, WPE allocates a new DMA-BUF every frame. */
+    if (_orig_render_buffer)
+        return _orig_render_buffer(view, buffer, rects, n_rects, error);
+    wpe_view_buffer_rendered(view, buffer);
     return TRUE;
 }
 
@@ -228,6 +254,23 @@ static gboolean idle_set_size(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/* ── Signal handlers ─────────────────────────────────────────────────── */
+
+static void on_web_process_terminated(WebKitWebView *wv,
+                                      WebKitWebProcessTerminationReason reason,
+                                      gpointer user_data)
+{
+    (void)user_data;
+    const char *msg = "unknown";
+    switch (reason) {
+    case WEBKIT_WEB_PROCESS_CRASHED:               msg = "crashed";               break;
+    case WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT:  msg = "exceeded memory limit";  break;
+    case WEBKIT_WEB_PROCESS_TERMINATED_BY_API:      msg = "terminated by API";      break;
+    }
+    fprintf(stderr, "webview_linux: web process %s — reloading\n", msg);
+    webkit_web_view_reload(wv);
+}
+
 /* ── Public C API ────────────────────────────────────────────────────── */
 
 int WebView_Create(int width, int height)
@@ -237,7 +280,7 @@ int WebView_Create(int width, int height)
 
     GError *error = NULL;
 
-    /* Open a DRI render node for GBM so we can import DMA-BUF frames. */
+    /* Open a DRI render node for GBM so we can de-tile DMA-BUF frames. */
     const char *render_nodes[] = {
         "/dev/dri/renderD128", "/dev/dri/renderD129", NULL
     };
@@ -265,16 +308,36 @@ int WebView_Create(int width, int height)
     /* Make this the primary display so webkit_web_view_new(NULL) picks it up. */
     wpe_display_set_primary(_display);
 
-    /* Disable GPU-accelerated rendering.  In headless mode we copy every
-       frame into a CPU pixel buffer anyway; letting the web process use
-       the GPU causes it to allocate DMA-BUF / GPU buffers that are not
-       reclaimed fast enough, leading to unbounded memory growth in
-       WPEWebProcess.
-       The enum value 2 == WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER
-       (the convenience function and enum are not exposed in WPE headers). */
+    /* ── Memory pressure — MUST be set before any WebKitNetworkSession
+       or WebKitWebContext is touched, otherwise the defaults are already
+       baked in and these calls are silently ignored. ────────────────── */
+    WebKitMemoryPressureSettings *mem = webkit_memory_pressure_settings_new();
+    webkit_memory_pressure_settings_set_memory_limit(mem, 256);
+    webkit_memory_pressure_settings_set_conservative_threshold(mem, 0.3);
+    webkit_memory_pressure_settings_set_strict_threshold(mem, 0.5);
+    webkit_memory_pressure_settings_set_kill_threshold(mem, 0.8);
+    /* Poll every second so the pressure handler fires even without
+       cgroup memory-pressure notifications from the OS. */
+    webkit_memory_pressure_settings_set_poll_interval(mem, 1.0);
+    webkit_network_session_set_memory_pressure_settings(mem);
+    webkit_memory_pressure_settings_free(mem);
+
+    /* Now it is safe to touch the web context / cache model. */
+    webkit_web_context_set_cache_model(
+        webkit_web_context_get_default(),
+        WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER);
+
     WebKitSettings *settings = webkit_settings_new();
-    g_object_set(G_OBJECT(settings),
-                 "hardware-acceleration-policy", 2, NULL);
+    webkit_settings_set_enable_page_cache(settings, FALSE);
+    webkit_settings_set_enable_html5_local_storage(settings, FALSE);
+    webkit_settings_set_enable_html5_database(settings, FALSE);
+    webkit_settings_set_enable_webaudio(settings, FALSE);
+    webkit_settings_set_enable_webgl(settings, FALSE);
+    webkit_settings_set_enable_2d_canvas_acceleration(settings, FALSE);
+    webkit_settings_set_enable_mediasource(settings, FALSE);
+    webkit_settings_set_enable_encrypted_media(settings, FALSE);
+    webkit_settings_set_enable_media_capabilities(settings, FALSE);
+    webkit_settings_set_enable_media_stream(settings, FALSE);
 
     /* Create the WebKitWebView using the primary (headless) display. */
     _webView = g_object_ref_sink(
@@ -286,6 +349,11 @@ int WebView_Create(int width, int height)
         fprintf(stderr, "webview_linux: webkit_web_view_new() failed\n");
         return 0;
     }
+
+    /* When the web process crashes or is killed for exceeding memory,
+       reload the current page to restart the process. */
+    g_signal_connect(_webView, "web-process-terminated",
+        G_CALLBACK(on_web_process_terminated), NULL);
 
     /* Retrieve the underlying WPEView. */
     _wpeView = webkit_web_view_get_wpe_view(_webView);
@@ -310,7 +378,8 @@ int WebView_Create(int width, int height)
     wpe_view_resized(_wpeView, width, height);
 
     /* Patch the WPEViewHeadless class vtable to capture rendered frames.
-       GObject class structures live on the heap (writable memory). */
+       Save the original so we can chain to it for proper buffer lifecycle. */
+    _orig_render_buffer = WPE_VIEW_GET_CLASS(_wpeView)->render_buffer;
     WPE_VIEW_GET_CLASS(_wpeView)->render_buffer = our_render_buffer;
 
     /* Map the view so WPE starts rendering. */
@@ -319,9 +388,16 @@ int WebView_Create(int width, int height)
     return 1;
 }
 
-void WebView_IterateLoop(void)
+void WebView_RunLoop(void)
 {
-    g_main_context_iteration(NULL, FALSE);
+    /* Run the real GLib main loop so that all GLib/WebKit timers,
+       idle handlers, and — critically — the memory-pressure poller
+       fire on schedule.  The previous approach (pumping the context
+       at 30 Hz from the Fyne thread) starved low-priority sources
+       like GC and tile-cache cleanup whenever rendering was busy. */
+    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+    g_main_loop_run(loop);          /* blocks forever */
+    g_main_loop_unref(loop);
 }
 
 void WebView_SetFrame(int x, int y, int width, int height)
@@ -394,8 +470,6 @@ void WebView_Stop(void)      { g_idle_add(idle_stop,       NULL); }
 /* ── Input events ────────────────────────────────────────────────────── */
 
 typedef struct { double x, y; int button; int down; } MouseBtnArgs;
-typedef struct { double x, y; }                        MouseMoveArgs;
-typedef struct { double x, y, dx, dy; }                ScrollArgs;
 
 static guint32 _ms_now(void) { return (guint32)(g_get_monotonic_time() / 1000); }
 
@@ -416,32 +490,62 @@ static gboolean idle_mouse_btn(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/* ── Coalesced mouse-move: only the latest position is dispatched ──── */
+
+static pthread_mutex_t _moveMu      = PTHREAD_MUTEX_INITIALIZER;
+static double          _moveX       = 0;
+static double          _moveY       = 0;
+static int             _movePending = 0;
+
 static gboolean idle_mouse_move(gpointer data)
 {
-    MouseMoveArgs *a = data;
+    (void)data;
+    pthread_mutex_lock(&_moveMu);
+    double x = _moveX;
+    double y = _moveY;
+    _movePending = 0;
+    pthread_mutex_unlock(&_moveMu);
+
     if (_wpeView) {
         WPEEvent *ev = wpe_event_pointer_move_new(
             WPE_EVENT_POINTER_MOVE, _wpeView,
             WPE_INPUT_SOURCE_MOUSE, _ms_now(),
-            0, a->x, a->y, 0, 0);
+            0, x, y, 0, 0);
         wpe_view_event(_wpeView, ev);
         wpe_event_unref(ev);
     }
-    free(a);
     return G_SOURCE_REMOVE;
 }
 
+/* ── Coalesced scroll: accumulate deltas, dispatch once per idle ──── */
+
+static pthread_mutex_t _scrollMu      = PTHREAD_MUTEX_INITIALIZER;
+static double          _scrollX       = 0;
+static double          _scrollY       = 0;
+static double          _scrollDX      = 0;
+static double          _scrollDY      = 0;
+static int             _scrollPending = 0;
+
 static gboolean idle_scroll(gpointer data)
 {
-    ScrollArgs *a = data;
+    (void)data;
+    pthread_mutex_lock(&_scrollMu);
+    double x  = _scrollX;
+    double y  = _scrollY;
+    double dx = _scrollDX;
+    double dy = _scrollDY;
+    _scrollDX = 0;
+    _scrollDY = 0;
+    _scrollPending = 0;
+    pthread_mutex_unlock(&_scrollMu);
+
     if (_wpeView) {
         WPEEvent *ev = wpe_event_scroll_new(
             _wpeView, WPE_INPUT_SOURCE_MOUSE, _ms_now(),
-            0, a->dx, a->dy, FALSE, FALSE, a->x, a->y);
+            0, dx, dy, FALSE, FALSE, x, y);
         wpe_view_event(_wpeView, ev);
         wpe_event_unref(ev);
     }
-    free(a);
     return G_SOURCE_REMOVE;
 }
 
@@ -459,14 +563,30 @@ void WebView_MouseUp(double x, double y, int button)
 
 void WebView_MouseMove(double x, double y)
 {
-    MouseMoveArgs *a = malloc(sizeof *a);
-    if (a) { *a = (MouseMoveArgs){x, y}; g_idle_add(idle_mouse_move, a); }
+    pthread_mutex_lock(&_moveMu);
+    _moveX = x;
+    _moveY = y;
+    int was_pending = _movePending;
+    _movePending = 1;
+    pthread_mutex_unlock(&_moveMu);
+
+    if (!was_pending)
+        g_idle_add(idle_mouse_move, NULL);
 }
 
 void WebView_Scroll(double x, double y, double dx, double dy)
 {
-    ScrollArgs *a = malloc(sizeof *a);
-    if (a) { *a = (ScrollArgs){x, y, dx, dy}; g_idle_add(idle_scroll, a); }
+    pthread_mutex_lock(&_scrollMu);
+    _scrollX   = x;
+    _scrollY   = y;
+    _scrollDX += dx;
+    _scrollDY += dy;
+    int was_pending = _scrollPending;
+    _scrollPending = 1;
+    pthread_mutex_unlock(&_scrollMu);
+
+    if (!was_pending)
+        g_idle_add(idle_scroll, NULL);
 }
 
 typedef struct { guint keyval; int down; } KeyArgs;
