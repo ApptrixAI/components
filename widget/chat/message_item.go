@@ -25,6 +25,7 @@ func newMessageItem() *messageItem {
 	m.ExtendBaseWidget(m)
 
 	m.sender = widget.NewLabel("")
+	m.sender.SizeName = theme.SizeNameCaptionText
 	m.text = widget.NewLabel("")
 	m.text.Wrapping = fyne.TextWrapWord
 
