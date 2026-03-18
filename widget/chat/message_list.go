@@ -14,3 +14,8 @@ func newMessageList() *messageList {
 
 	return l
 }
+
+func (l *messageList) Resize(s fyne.Size) {
+	l.List.Resize(s)
+	l.List.ScrollToBottom()
+}
