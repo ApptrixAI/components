@@ -45,7 +45,7 @@ func (src *demoMessageSource) Length() int {
 	if src.pending == nil {
 		return n
 	}
-	return n+1
+	return n + 1
 }
 
 func (src *demoMessageSource) GetItem(n int) chat.Message {
