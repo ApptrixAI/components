@@ -1,7 +1,6 @@
 package chat
 
 import (
-	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -13,18 +12,21 @@ import (
 const ColorNameRemoteMessageBackground = "remote-msg-bg"
 const ColorNameLocalMessageBackground = "local-msg-bg"
 
+// Chat is a widget that shows a simple chat interface with a message list,
+// an input field, and send button.
 type Chat struct {
 	widget.BaseWidget
-	container     *fyne.Container
-	list          *messageList
-	input         *input
-	submit        *widget.Button
-	maxId         int
-	inputDisabled bool
-}
 
-type MessageSender interface {
-	Send(Message)
+	// OnSend is called when a send is triggered from the send button or the
+	// input field via enter key.
+	OnSend func(text string, time time.Time)
+
+	container *fyne.Container
+	list      *messageList
+	input     *input
+	submit    *widget.Button
+	source    MessageSource
+	maxId     int
 }
 
 type MessageSource interface {
@@ -32,32 +34,39 @@ type MessageSource interface {
 	GetItem(int) Message
 }
 
-func New(src MessageSource) *Chat {
-	c := &Chat{}
+// Creates a new chat widget, using the given source, and calling the onSend
+// function with the text and time of the message to send.
+func New(source MessageSource, onSend func(string, time.Time)) *Chat {
+	c := &Chat{
+		source: source,
+		OnSend: onSend,
+	}
 	c.ExtendBaseWidget(c)
-
-	sender, _ := src.(MessageSender)
 
 	c.list = newMessageList()
 	c.list.Length = func() int {
-		return src.Length()
+		if c.source == nil {
+			return 0
+		}
+		return c.source.Length()
 	}
 	c.list.CreateItem = func() fyne.CanvasObject {
 		return newMessageItem()
 	}
 	c.list.UpdateItem = func(id widget.ListItemID, obj fyne.CanvasObject) {
-		msg := src.GetItem(id)
+		if c.source == nil {
+			return
+		}
+		msg := c.source.GetItem(id)
 
 		item := obj.(*messageItem)
 		item.SetSender(msg.SenderName())
 		item.SetText(msg.Text())
-		item.SetOwner(msg.SenderName() == "me")
+		item.SetOwned(msg.Owned())
 
-		minSize := item.MinSize()
-
-		if item.height != minSize.Height {
-			item.height = minSize.Height
-			c.list.SetItemHeight(id, minSize.Height)
+		if minHeight := item.MinSize().Height; minHeight != item.height {
+			item.height = minHeight
+			c.list.SetItemHeight(id, minHeight)
 		}
 
 		// when an item id from an update is lower than the highest seen id
@@ -77,16 +86,13 @@ func New(src MessageSource) *Chat {
 		}
 	})
 	c.submit = widget.NewButtonWithIcon("", theme.MailSendIcon(), func() {
-		if sender == nil {
+		if c.input.Text == "" {
 			return
 		}
 
-		t := strings.TrimSpace(c.input.Text)
-		if len(t) == 0 {
-			return
+		if fn := c.OnSend; fn != nil {
+			fn(c.input.Text, time.Now())
 		}
-
-		sender.Send(&genericMessage{"", "sndrxxx", "me", t, time.Now()})
 
 		c.input.SetText("")
 		c.list.paused = false
@@ -94,28 +100,31 @@ func New(src MessageSource) *Chat {
 		c.list.Refresh()
 		c.list.ScrollToBottom()
 	})
+	c.submit.Disable()
+	c.input.OnChanged = func(s string) {
+		if c.input.Text == "" {
+			c.submit.Disable()
+		} else {
+			c.submit.Enable()
+		}
+	}
+
+	if c.OnSend == nil {
+		c.input.Disable()
+		c.submit.Disable()
+	}
 
 	bottom := container.NewBorder(
 		nil, nil,
 		nil, c.submit,
 		c.input,
 	)
-	if sender == nil {
-		if c.inputDisabled {
-			c.input.Disable()
-			c.submit.Disable()
-		} else {
-			bottom.Hide()
-		}
-	}
 
 	c.container = container.NewBorder(
 		nil, bottom,
 		nil, nil,
 		c.list,
 	)
-
-	c.list.Refresh()
 
 	return c
 }

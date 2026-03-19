@@ -19,6 +19,6 @@ func (src *listMessageSource) GetItem(n int) Message {
 	return src.msgs[n]
 }
 
-func (src *listMessageSource) Send(msg Message) {
+func (src *listMessageSource) Append(msg Message) {
 	src.msgs = append(src.msgs, msg)
 }

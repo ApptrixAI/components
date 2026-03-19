@@ -56,7 +56,7 @@ func (m *messageItem) SetSender(s string) {
 	m.sender.SetText(s)
 }
 
-func (m *messageItem) SetOwner(o bool) {
+func (m *messageItem) SetOwned(o bool) {
 	if o {
 		m.bg.FillColor = theme.Color(ColorNameLocalMessageBackground)
 		m.top.Layout = layout.NewBorderLayout(nil, nil, nil, m.sender)

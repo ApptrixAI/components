@@ -9,7 +9,8 @@ type Message interface {
 	SenderId() string
 	SenderName() string
 	Text() string
-	SentAt() time.Time
+	Time() time.Time
+	Owned() bool
 }
 
 type genericMessage struct {
@@ -17,11 +18,12 @@ type genericMessage struct {
 	senderId   string
 	senderName string
 	text       string
-	sentAt     time.Time
+	time       time.Time
+	owned      bool
 }
 
-func NewMessage(id, senderId, senderName, text string, sentAt time.Time) *genericMessage {
-	return &genericMessage{id, senderId, senderName, text, sentAt}
+func NewMessage(id, senderId, senderName, text string, time time.Time, owned bool) *genericMessage {
+	return &genericMessage{id, senderId, senderName, text, time, owned}
 }
 
 func (msg *genericMessage) Id() string {
@@ -40,6 +42,10 @@ func (msg *genericMessage) Text() string {
 	return msg.text
 }
 
-func (msg *genericMessage) SentAt() time.Time {
-	return msg.sentAt
+func (msg *genericMessage) Time() time.Time {
+	return msg.time
+}
+
+func (msg *genericMessage) Owned() bool {
+	return msg.owned
 }
