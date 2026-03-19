@@ -62,10 +62,7 @@ func New(source MessageSource, onSubmitted func(string)) *Chat {
 		item.SetText(msg.Text())
 		item.SetOwned(msg.Owned())
 
-		if minHeight := item.MinSize().Height; minHeight != item.height {
-			item.height = minHeight
-			c.list.SetItemHeight(id, minHeight)
-		}
+		c.list.SetItemHeight(id, item.MinSize().Height)
 
 		// when an item id from an update is lower than the highest seen id
 		// an item above the current view is being updated (scrolled back)
