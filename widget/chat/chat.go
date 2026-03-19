@@ -1,8 +1,6 @@
 package chat
 
 import (
-	"time"
-
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
@@ -17,9 +15,9 @@ const ColorNameLocalMessageBackground = "local-msg-bg"
 type Chat struct {
 	widget.BaseWidget
 
-	// OnSend is called when a send is triggered from the send button or the
+	// OnSubmitted is called when a send is triggered from the send button or the
 	// input field via enter key.
-	OnSend func(text string, time time.Time)
+	OnSubmitted func(text string)
 
 	container *fyne.Container
 	list      *messageList
@@ -36,10 +34,10 @@ type MessageSource interface {
 
 // Creates a new chat widget, using the given source, and calling the onSend
 // function with the text and time of the message to send.
-func New(source MessageSource, onSend func(string, time.Time)) *Chat {
+func New(source MessageSource, onSubmitted func(string)) *Chat {
 	c := &Chat{
-		source: source,
-		OnSend: onSend,
+		source:      source,
+		OnSubmitted: onSubmitted,
 	}
 	c.ExtendBaseWidget(c)
 
@@ -90,8 +88,8 @@ func New(source MessageSource, onSend func(string, time.Time)) *Chat {
 			return
 		}
 
-		if fn := c.OnSend; fn != nil {
-			fn(c.input.Text, time.Now())
+		if fn := c.OnSubmitted; fn != nil {
+			fn(c.input.Text)
 		}
 
 		c.input.SetText("")
@@ -109,7 +107,7 @@ func New(source MessageSource, onSend func(string, time.Time)) *Chat {
 		}
 	}
 
-	if c.OnSend == nil {
+	if c.OnSubmitted == nil {
 		c.input.Disable()
 		c.submit.Disable()
 	}
