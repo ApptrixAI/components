@@ -52,12 +52,11 @@ func newMessageItem() *messageItem {
 	return m
 }
 
-func (m *messageItem) SetSender(s string) {
-	m.sender.SetText(s)
-}
+func (m *messageItem) SetMessage(msg Message) {
+	m.sender.SetText(msg.SenderName())
+	m.text.SetText(msg.Text())
 
-func (m *messageItem) SetOwned(o bool) {
-	if o {
+	if msg.IsMine() {
 		m.bg.FillColor = theme.Color(ColorNameLocalMessageBackground)
 		m.top.Layout = layout.NewBorderLayout(nil, nil, nil, m.sender)
 		m.container.Layout = layout.NewBorderLayout(m.top, nil, m.spacer, nil)
@@ -66,14 +65,8 @@ func (m *messageItem) SetOwned(o bool) {
 		m.top.Layout = layout.NewBorderLayout(nil, nil, m.sender, nil)
 		m.container.Layout = layout.NewBorderLayout(m.top, nil, nil, m.spacer)
 	}
-	m.text.Refresh()
 	m.bg.Refresh()
 	m.container.Refresh()
-}
-
-func (m *messageItem) SetText(s string) {
-	m.text.Text = s
-	m.text.Refresh()
 }
 
 func (m *messageItem) CreateRenderer() fyne.WidgetRenderer {

@@ -10,7 +10,7 @@ type Message interface {
 	SenderName() string
 	Text() string
 	Time() time.Time
-	Owned() bool
+	IsMine() bool
 }
 
 type genericMessage struct {
@@ -19,11 +19,11 @@ type genericMessage struct {
 	senderName string
 	text       string
 	time       time.Time
-	owned      bool
+	mine       bool
 }
 
-func NewMessage(id, senderId, senderName, text string, time time.Time, owned bool) *genericMessage {
-	return &genericMessage{id, senderId, senderName, text, time, owned}
+func NewMessage(id, senderId, senderName, text string, time time.Time, mine bool) *genericMessage {
+	return &genericMessage{id, senderId, senderName, text, time, mine}
 }
 
 func (msg *genericMessage) Id() string {
@@ -46,6 +46,6 @@ func (msg *genericMessage) Time() time.Time {
 	return msg.time
 }
 
-func (msg *genericMessage) Owned() bool {
-	return msg.owned
+func (msg *genericMessage) IsMine() bool {
+	return msg.mine
 }
