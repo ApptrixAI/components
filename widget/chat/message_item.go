@@ -28,6 +28,7 @@ func newMessageItem() *messageItem {
 	m.sender.SizeName = theme.SizeNameCaptionText
 	m.text = widget.NewLabel("")
 	m.text.Wrapping = fyne.TextWrapWord
+	m.text.Selectable = true
 
 	m.bg = &canvas.Rectangle{}
 	m.bg.FillColor = theme.Color(ColorNameRemoteMessageBackground)
