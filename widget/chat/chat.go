@@ -89,8 +89,9 @@ func New(src MessageSource) *Chat {
 		sender.Send(&genericMessage{"", "sndrxxx", "me", t, time.Now()})
 
 		c.input.SetText("")
-		c.list.Refresh()
+		c.list.paused = false
 		c.list.ScrollToBottom()
+		c.list.Refresh()
 		c.list.ScrollToBottom()
 	})
 
