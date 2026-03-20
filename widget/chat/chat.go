@@ -17,7 +17,7 @@ type Chat struct {
 
 	// OnSubmitted is called when a send is triggered from the send button or the
 	// input field via enter key.
-	OnSubmitted func(text string)
+	OnSubmitted func(text string) `json:"-"`
 
 	container *fyne.Container
 	list      *messageList
