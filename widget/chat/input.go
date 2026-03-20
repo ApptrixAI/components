@@ -11,11 +11,8 @@ type input struct {
 }
 
 func newInput(submit func()) *input {
-	i := &input{}
+	i := &input{onSubmit: submit}
 	i.ExtendBaseWidget(i)
-	i.onSubmit = submit
-	//i.MultiLine = true
-	//i.Wrapping = fyne.TextWrapBreak
 
 	return i
 }
