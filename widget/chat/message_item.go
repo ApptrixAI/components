@@ -52,7 +52,7 @@ func newMessageItem() *messageItem {
 	return m
 }
 
-func (m *messageItem) SetMessage(msg Message) {
+func (m *messageItem) setMessage(msg Message) {
 	m.sender.SetText(msg.SenderName())
 	m.text.SetText(msg.Text())
 

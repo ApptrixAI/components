@@ -58,7 +58,7 @@ func New(source MessageSource, onSubmitted func(string)) *Chat {
 		msg := c.source.GetItem(id)
 
 		item := obj.(*messageItem)
-		item.SetMessage(msg)
+		item.setMessage(msg)
 
 		c.list.SetItemHeight(id, item.MinSize().Height)
 
