@@ -32,7 +32,7 @@ func newDemoMessageSource(initialSize int) *demoMessageSource {
 			"Someone",
 			src.gen.Sentences(1),
 			sentAt,
-			false,
+			n % 3 == 0,
 		))
 		sentAt = sentAt.Add(time.Hour)
 	}

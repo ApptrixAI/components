@@ -32,7 +32,7 @@ func NewDummyMessageSource(n int) *listMessageSource {
 			"Dummy",
 			dummyMessageTexts[i%len(dummyMessageTexts)],
 			time.Date(2026, time.February, 1, 12, i, 0, 0, time.UTC),
-			false,
+			i % 3 == 0,
 		))
 	}
 	return NewMessageSourceFromList(msgs)
