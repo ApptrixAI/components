@@ -26,13 +26,20 @@ func newDemoMessageSource(initialSize int) *demoMessageSource {
 
 	sentAt := time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC)
 	for n := 0; n < initialSize; n++ {
+		senderId := "sndr-1"
+		senderName := "Someone"
+		isMine := n % 3 == 0
+		if isMine {
+			senderId = "sndr-2"
+			senderName = "Me"
+		}
 		src.msgs = append(src.msgs, chat.NewMessage(
 			fmt.Sprintf("msgid-%03d", n),
-			"sndrid-001",
-			"Someone",
+			senderId,
+			senderName,
 			src.gen.Sentences(1),
 			sentAt,
-			n % 3 == 0,
+			isMine,
 		))
 		sentAt = sentAt.Add(time.Hour)
 	}
