@@ -28,7 +28,7 @@ func newDemoMessageSource(initialSize int) *demoMessageSource {
 	for n := 0; n < initialSize; n++ {
 		senderId := "sndr-1"
 		senderName := "Someone"
-		isMine := n % 3 == 0
+		isMine := n%3 == 0
 		if isMine {
 			senderId = "sndr-2"
 			senderName = "Me"

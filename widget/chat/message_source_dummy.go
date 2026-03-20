@@ -28,7 +28,7 @@ func NewDummyMessageSource(n int) *listMessageSource {
 	for i := 0; i < n; i++ {
 		senderId := "sndr-1"
 		senderName := "Dummy"
-		isMine := i % 3 == 0
+		isMine := i%3 == 0
 		if isMine {
 			senderId = "sndr-2"
 			senderName = "Me"
