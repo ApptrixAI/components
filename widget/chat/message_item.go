@@ -17,7 +17,6 @@ type messageItem struct {
 	text      *widget.Label
 	bg        *canvas.Rectangle
 	spacer    fyne.CanvasObject
-	height    float32
 }
 
 func newMessageItem() *messageItem {
