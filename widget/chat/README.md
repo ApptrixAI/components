@@ -9,7 +9,6 @@ submitted, the function is called with the text as argument to send a message.
 
 To run example chat application with random messsages:
 ```
-cd example
-go mod tidy
-go run example_*.go
+cd cmd/chat_example
+go run .
 ```
