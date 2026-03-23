@@ -20,6 +20,7 @@ type Chat struct {
 	OnSubmitted func(text string) `json:"-"`
 
 	container *fyne.Container
+	follow    *fyne.Container
 	list      *messageList
 	input     *input
 	submit    *widget.Button
@@ -68,6 +69,11 @@ func New(source MessageSource, onSubmitted func(string)) *Chat {
 			c.maxId = id
 		}
 		c.list.paused = id < c.maxId
+		if c.list.paused {
+			c.follow.Show()
+		} else {
+			c.follow.Hide()
+		}
 	}
 	c.list.OnSelected = func(id widget.ListItemID) {
 		c.list.UnselectAll()
@@ -113,10 +119,25 @@ func New(source MessageSource, onSubmitted func(string)) *Chat {
 		c.input,
 	)
 
+	followButton := widget.NewButtonWithIcon("", theme.MoveDownIcon(), func() {
+		c.list.paused = false
+		c.list.ScrollToBottom()
+	})
+	c.follow = container.NewBorder(
+		nil, container.NewBorder(
+			nil, nil,
+			nil, container.NewPadded(followButton),
+		),
+		nil, nil,
+	)
+
 	c.container = container.NewBorder(
 		nil, bottom,
 		nil, nil,
-		c.list,
+		container.NewStack(
+			c.list,
+			c.follow,
+		),
 	)
 
 	return c
