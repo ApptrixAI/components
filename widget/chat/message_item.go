@@ -31,7 +31,7 @@ func newMessageItem() *messageItem {
 	m.text.Selectable = true
 
 	m.bg = &canvas.Rectangle{}
-	m.bg.FillColor = theme.Color(ColorNameRemoteMessageBackground)
+	m.bg.FillColor = theme.ColorForWidget(ColorNameRemoteMessageBackground, m)
 	m.bg.CornerRadius = m.text.MinSize().Height / 6
 
 	m.spacer = widget.NewLabel("")
@@ -57,11 +57,11 @@ func (m *messageItem) setMessage(msg Message) {
 	m.text.SetText(msg.Text())
 
 	if msg.IsMine() {
-		m.bg.FillColor = theme.Color(ColorNameLocalMessageBackground)
+		m.bg.FillColor = theme.ColorForWidget(ColorNameLocalMessageBackground, m)
 		m.top.Layout = layout.NewBorderLayout(nil, nil, nil, m.sender)
 		m.container.Layout = layout.NewBorderLayout(m.top, nil, m.spacer, nil)
 	} else {
-		m.bg.FillColor = theme.Color(ColorNameRemoteMessageBackground)
+		m.bg.FillColor = theme.ColorForWidget(ColorNameRemoteMessageBackground, m)
 		m.top.Layout = layout.NewBorderLayout(nil, nil, m.sender, nil)
 		m.container.Layout = layout.NewBorderLayout(m.top, nil, nil, m.spacer)
 	}
