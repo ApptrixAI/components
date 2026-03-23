@@ -130,6 +130,7 @@ func New(source MessageSource, onSubmitted func(string)) *Chat {
 		),
 		nil, nil,
 	)
+	c.follow.Hide()
 
 	c.container = container.NewBorder(
 		nil, bottom,
