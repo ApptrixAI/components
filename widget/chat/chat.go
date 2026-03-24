@@ -130,6 +130,7 @@ func (c *Chat) setup() {
 	followButton := widget.NewButtonWithIcon("", theme.MoveDownIcon(), func() {
 		c.list.paused = false
 		c.list.ScrollToBottom()
+		c.list.RefreshItem(c.Source.Length()-1)
 	})
 	c.follow = container.NewBorder(
 		nil, container.NewBorder(
