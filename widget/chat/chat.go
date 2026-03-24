@@ -19,12 +19,15 @@ type Chat struct {
 	// input field via enter key.
 	OnSubmitted func(text string) `json:"-"`
 
+	// Source is a simple list-oriented message source that only needs to
+	// provide a Length and GetMessage method.
+	Source    MessageSource
+
 	container *fyne.Container
 	follow    *fyne.Container
 	list      *messageList
 	input     *input
 	submit    *widget.Button
-	source    MessageSource
 	maxId     int
 }
 
@@ -37,23 +40,23 @@ type MessageSource interface {
 // function with the text and time of the message to send.
 func New(source MessageSource, onSubmitted func(string)) *Chat {
 	c := &Chat{
-		source:      source,
+		Source:      source,
 		OnSubmitted: onSubmitted,
 	}
 	c.ExtendBaseWidget(c)
 
 	c.list = newMessageList()
 	c.list.Length = func() int {
-		if c.source == nil {
+		if c.Source == nil {
 			return 0
 		}
-		return c.source.Length()
+		return c.Source.Length()
 	}
 	c.list.CreateItem = func() fyne.CanvasObject {
 		return newMessageItem()
 	}
 	c.list.UpdateItem = func(id widget.ListItemID, obj fyne.CanvasObject) {
-		if c.source == nil {
+		if c.Source == nil {
 			return
 		}
 		msg := c.Source.GetMessage(id)
