@@ -44,7 +44,12 @@ func New(source MessageSource, onSubmitted func(string)) *Chat {
 		OnSubmitted: onSubmitted,
 	}
 	c.ExtendBaseWidget(c)
+	c.setup()
 
+	return c
+}
+
+func (c *Chat) setup() {
 	c.list = newMessageList()
 	c.list.Length = func() int {
 		if c.Source == nil {
@@ -143,14 +148,19 @@ func New(source MessageSource, onSubmitted func(string)) *Chat {
 			c.follow,
 		),
 	)
-
-	return c
 }
 
 func (c *Chat) ScrollToBottom() {
 	c.list.ScrollToBottom()
 }
 
+func (c *Chat) Refresh() {
+	c.container.Refresh()
+}
+
 func (c *Chat) CreateRenderer() fyne.WidgetRenderer {
+	if c.container == nil {
+		c.setup()
+	}
 	return widget.NewSimpleRenderer(c.container)
 }
