@@ -19,5 +19,5 @@ jobs:
         env:
           GOOS: js
           GOARCH: wasm
-        working-directory: cmd/fyne_demo
+        working-directory: cmd/chat_example
         run: go build

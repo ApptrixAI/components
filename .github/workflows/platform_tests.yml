@@ -10,9 +10,9 @@ jobs:
       fail-fast: false
       matrix:
         go-version: ["", "stable"]
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-22.04, macos-latest]
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             runner: xvfb-run
             tags: ci,migrated_fynedo
           - os: macos-latest
@@ -29,8 +29,9 @@ jobs:
 
       - name: Get dependencies
         run: |
+          sudo add-apt-repository universe
           sudo apt-get update
-          sudo apt-get install --no-install-recommends bc clang lld libgl1-mesa-dev libwayland-dev libx11-dev libxkbcommon-dev xorg-dev xvfb language-pack-en fonts-noto-cjk
+          sudo apt-get install --no-install-recommends bc clang lld libgl1-mesa-dev libwayland-dev libx11-dev libxkbcommon-dev xorg-dev xvfb language-pack-en fonts-noto-cjk libwpewebkit-1.0-dev libgbm-dev
           echo "CC=clang" >> "$GITHUB_ENV"
           echo "CGO_LDFLAGS=-fuse-ld=lld" >> "$GITHUB_ENV"
         if: ${{ runner.os == 'Linux' }}

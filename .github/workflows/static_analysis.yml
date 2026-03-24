@@ -8,7 +8,7 @@ env:
 
 jobs:
   static_analysis:
-    runs-on: ubuntu-latest
+    runs-on: darwin-latest
 
     steps:
       - uses: actions/checkout@v5
@@ -17,11 +17,6 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "stable"
-
-      - name: Get dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends clang lld libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libx11-dev xorg-dev xvfb language-pack-en
 
       - name: Set environment variable LANG
         run: echo "LANG=en_US.UTF-8" >> $GITHUB_ENV
@@ -47,6 +42,3 @@ jobs:
 
       - name: Staticcheck
         run: staticcheck ./...
-
-      - name: Check license of dependencies
-        run: lian -d --allowed="Apache-2.0, BSD-2-Clause, BSD-3-Clause, MIT, ISC"

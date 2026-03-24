@@ -8,7 +8,7 @@ env:
 
 jobs:
   mobile_tests:
-    runs-on: ubuntu-latest
+    runs-on: darwin-latest
     strategy:
       fail-fast: false
       matrix:
@@ -23,11 +23,6 @@ jobs:
           go-version: ${{ matrix.go-version }}
           go-version-file: "go.mod"
 
-      - name: Get dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends clang lld libegl1-mesa-dev libgles2-mesa-dev libx11-dev xorg-dev fonts-noto-cjk
-
       - name: Set environment variable LANG
         run: echo "LANG=en_US.UTF-8" >> $GITHUB_ENV
 
@@ -35,5 +30,5 @@ jobs:
         run: xvfb-run go test -race -tags mobile,ci,migrated_fynedo ./...
 
       - name: Compile
-        working-directory: cmd/fyne_demo
+        working-directory: cmd/chat_example
         run: go build -tags mobile
