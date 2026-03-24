@@ -83,7 +83,7 @@ func (src *demoMessageSource) Length() int {
 	return n + 1
 }
 
-func (src *demoMessageSource) GetItem(n int) chat.Message {
+func (src *demoMessageSource) GetMessage(n int) chat.Message {
 	if n == len(src.msgs) && src.pending != nil {
 		return src.pending
 	}

@@ -30,7 +30,7 @@ type Chat struct {
 
 type MessageSource interface {
 	Length() int
-	GetItem(int) Message
+	GetMessage(int) Message
 }
 
 // Creates a new chat widget, using the given source, and calling the onSend
@@ -56,7 +56,7 @@ func New(source MessageSource, onSubmitted func(string)) *Chat {
 		if c.source == nil {
 			return
 		}
-		msg := c.source.GetItem(id)
+		msg := c.Source.GetMessage(id)
 
 		item := obj.(*messageItem)
 		item.setMessage(msg)
