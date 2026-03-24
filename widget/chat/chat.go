@@ -151,7 +151,6 @@ func (c *Chat) setup() {
 }
 
 func (c *Chat) Refresh() {
-	c.list.ScrollToBottom()
 	c.list.Refresh()
 	c.list.ScrollToBottom()
 }
