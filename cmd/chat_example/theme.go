@@ -9,8 +9,7 @@ import (
 	"apptrix.org/components/widget/chat"
 )
 
-type myTheme struct {
-}
+type myTheme struct {}
 
 func (m *myTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
 	if name == chat.ColorNameRemoteMessageBackground {
@@ -19,7 +18,6 @@ func (m *myTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) col
 	if name == chat.ColorNameLocalMessageBackground {
 		return colornames.Green
 	}
-
 	return theme.DefaultTheme().Color(name, variant)
 }
 

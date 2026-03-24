@@ -13,7 +13,6 @@ type input struct {
 func newInput(submit func()) *input {
 	i := &input{onSubmit: submit}
 	i.ExtendBaseWidget(i)
-
 	return i
 }
 

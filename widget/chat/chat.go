@@ -45,7 +45,6 @@ func New(source MessageSource, onSubmitted func(string)) *Chat {
 	}
 	c.ExtendBaseWidget(c)
 	c.setup()
-
 	return c
 }
 

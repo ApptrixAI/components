@@ -13,7 +13,6 @@ type messageList struct {
 func newMessageList() *messageList {
 	l := &messageList{}
 	l.ExtendBaseWidget(l)
-
 	return l
 }
 
