@@ -1,6 +1,6 @@
-# Apptrix Chat Widget
+# Chat Widget
 
-Simple chat interface with an easy API for quick integration, that only requires
+A simple chat interface with an easy API for quick integration, that only requires
 two methods on the message source, and returns a basic message format.
 With a defined callback the input field and send button are enabled, and when
 submitted, the function is called with the text as argument to send a message.
