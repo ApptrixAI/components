@@ -1,15 +1,16 @@
 package main
 
 import (
+	"image/color"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/theme"
 	"golang.org/x/image/colornames"
-	"image/color"
 
 	"apptrix.org/components/widget/chat"
 )
 
-type myTheme struct {}
+type myTheme struct{}
 
 func (m *myTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
 	if name == chat.ColorNameRemoteMessageBackground {

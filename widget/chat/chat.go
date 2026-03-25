@@ -7,8 +7,10 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-const ColorNameRemoteMessageBackground = "remote-msg-bg"
-const ColorNameLocalMessageBackground = "local-msg-bg"
+const (
+	ColorNameRemoteMessageBackground = "remote-msg-bg"
+	ColorNameLocalMessageBackground  = "local-msg-bg"
+)
 
 // Chat is a widget that shows a simple chat interface with a message list,
 // an input field, and send button.
@@ -21,7 +23,7 @@ type Chat struct {
 
 	// Source is a simple list-oriented message source that only needs to
 	// provide a Length and GetMessage method.
-	Source    MessageSource
+	Source MessageSource
 
 	container *fyne.Container
 	follow    *fyne.Container
@@ -129,7 +131,7 @@ func (c *Chat) setup() {
 	followButton := widget.NewButtonWithIcon("", theme.MoveDownIcon(), func() {
 		c.list.paused = false
 		c.list.ScrollToBottom()
-		c.list.RefreshItem(c.Source.Length()-1)
+		c.list.RefreshItem(c.Source.Length() - 1)
 	})
 	c.follow = container.NewBorder(
 		nil, container.NewBorder(

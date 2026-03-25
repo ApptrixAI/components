@@ -10,6 +10,7 @@ package webview
 #include <stdlib.h>
 */
 import "C"
+
 import (
 	"image"
 	"net/url"
@@ -61,8 +62,6 @@ func newWebView(_ fyne.Window) *webView {
 	// Move JSC's GC signal away from SIGUSR1 (signal 10) which
 	// conflicts with Go's runtime signal handlers.
 	os.Setenv("JSC_SIGNAL_FOR_GC", "42")
-
-
 
 	// Create the WebView and run the GLib main loop on the SAME
 	// locked OS thread.  GLib expects the thread that creates the

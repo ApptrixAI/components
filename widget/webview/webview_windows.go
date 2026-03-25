@@ -12,6 +12,7 @@ static inline void WebView_CreateFromUintptr(uintptr_t p) {
 }
 */
 import "C"
+
 import (
 	"net/url"
 	"unsafe"
