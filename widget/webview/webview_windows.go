@@ -5,6 +5,11 @@ package webview
 
 #include "webview_windows.h"
 #include <stdlib.h>
+#include <stdint.h>
+
+static inline void WebView_CreateFromUintptr(uintptr_t p) {
+	WebView_Create((void *)p);
+}
 */
 import "C"
 import (
@@ -32,7 +37,7 @@ func newWebView(win fyne.Window) *webView {
 				return
 			}
 
-			C.WebView_Create(unsafe.Pointer(handle))
+			C.WebView_CreateFromUintptr(C.uintptr_t(handle))
 			w.updateFrame()
 			w.created = true
 		})
@@ -41,13 +46,9 @@ func newWebView(win fyne.Window) *webView {
 	w.ExtendBaseWidget(w)
 	w.syncTheme()
 
-	ch := make(chan fyne.Settings)
-	fyne.CurrentApp().Settings().AddChangeListener(ch)
-	go func() {
-		for range ch {
-			fyne.Do(w.syncTheme)
-		}
-	}()
+	fyne.CurrentApp().Settings().AddListener(func(fyne.Settings) {
+		fyne.Do(w.syncTheme)
+	})
 
 	return w
 }
