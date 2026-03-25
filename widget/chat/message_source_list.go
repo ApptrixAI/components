@@ -12,7 +12,7 @@ func (src *listMessageSource) Length() int {
 	return len(src.msgs)
 }
 
-func (src *listMessageSource) GetItem(n int) Message {
+func (src *listMessageSource) GetMessage(n int) Message {
 	if n < 0 || n >= len(src.msgs) {
 		return nil
 	}
