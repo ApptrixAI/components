@@ -7,6 +7,9 @@ import (
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 
 	"apptrix.org/components/widget/chat"
 )
@@ -71,6 +74,48 @@ func newDemoMessageSource(initialSize int) *demoMessageSource {
 		))
 		sentAt = sentAt.Add(time.Hour)
 	}
+
+	logo := canvas.NewImageFromResource(theme.FyneLogo())
+	logo.FillMode = canvas.ImageFillContain
+	logo.ScaleMode = canvas.ImageScaleFastest
+	src.msgs = append(src.msgs, chat.NewObjectMessage(
+		fmt.Sprintf("msgid-%03d", initialSize+2),
+		"sndr-x",
+		"Anyone",
+		logo,
+		sentAt,
+		false,
+	))
+	sentAt = sentAt.Add(time.Hour)
+
+	radio := widget.NewRadioGroup([]string{
+		"This",
+		"That",
+	}, nil)
+	src.msgs = append(src.msgs, chat.NewObjectMessage(
+		fmt.Sprintf("msgid-%03d", initialSize+3),
+		"sndr-x",
+		"Anyone",
+		radio,
+		sentAt,
+		false,
+	))
+	sentAt = sentAt.Add(time.Hour)
+
+	form := widget.NewForm(
+		widget.NewFormItem("Input", widget.NewEntry()),
+		widget.NewFormItem("Check", widget.NewCheck("Stuff", nil)),
+	)
+	form.OnSubmit = func() {}
+	src.msgs = append(src.msgs, chat.NewObjectMessage(
+		fmt.Sprintf("msgid-%03d", initialSize+4),
+		"sndr-x",
+		"Anyone",
+		form,
+		sentAt,
+		false,
+	))
+	sentAt = sentAt.Add(time.Hour)
 
 	return src
 }
