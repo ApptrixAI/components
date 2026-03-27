@@ -115,7 +115,6 @@ func newDemoMessageSource(initialSize int) *demoMessageSource {
 		sentAt,
 		false,
 	))
-	sentAt = sentAt.Add(time.Hour)
 
 	return src
 }
