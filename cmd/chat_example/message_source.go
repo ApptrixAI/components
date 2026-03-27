@@ -75,6 +75,7 @@ func newDemoMessageSource(initialSize int) *demoMessageSource {
 		sentAt = sentAt.Add(time.Hour)
 	}
 
+	//lint:ignore SA1019 avoid adding an extra resource
 	logo := canvas.NewImageFromResource(theme.FyneLogo())
 	logo.FillMode = canvas.ImageFillContain
 	logo.ScaleMode = canvas.ImageScaleFastest
