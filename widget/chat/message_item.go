@@ -17,6 +17,7 @@ type messageItem struct {
 	text      *widget.Label
 	bg        *canvas.Rectangle
 	spacer    fyne.CanvasObject
+	obj       *fyne.Container
 }
 
 func newMessageItem() *messageItem {
@@ -33,6 +34,9 @@ func newMessageItem() *messageItem {
 	m.bg.FillColor = theme.ColorForWidget(ColorNameRemoteMessageBackground, m)
 	m.bg.CornerRadius = m.text.MinSize().Height / 6
 
+	m.obj = container.NewPadded()
+	m.obj.Hide()
+
 	m.spacer = widget.NewLabel("")
 
 	m.top = container.NewBorder(
@@ -44,6 +48,7 @@ func newMessageItem() *messageItem {
 		nil, m.spacer,
 		container.NewStack(
 			m.bg,
+			m.obj,
 			m.text,
 		),
 	)
@@ -53,7 +58,16 @@ func newMessageItem() *messageItem {
 
 func (m *messageItem) setMessage(msg Message) {
 	m.sender.SetText(msg.SenderName())
-	m.text.SetText(msg.Text())
+
+	if omsg, ok := msg.(ObjectMessage); ok {
+		m.obj.Objects = []fyne.CanvasObject{omsg.Object()}
+		m.obj.Show()
+		m.text.Hide()
+	} else {
+		m.text.SetText(msg.Text())
+		m.text.Show()
+		m.obj.Hide()
+	}
 
 	if msg.IsMine() {
 		m.bg.FillColor = theme.ColorForWidget(ColorNameLocalMessageBackground, m)

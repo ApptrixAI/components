@@ -2,8 +2,12 @@ package chat
 
 import (
 	"time"
+
+	"fyne.io/fyne/v2"
 )
 
+// Message describes a simple text message object with basic information
+// necessary for a graphical representation.
 type Message interface {
 	Id() string
 	SenderId() string
@@ -11,6 +15,13 @@ type Message interface {
 	Text() string
 	Time() time.Time
 	IsMine() bool
+}
+
+// ObjectMessage describes a message object that returns a fyne.CanvasObject
+// to support rendering of images, links, forms, and more.
+type ObjectMessage interface {
+	Message
+	Object() fyne.CanvasObject
 }
 
 type genericMessage struct {
@@ -22,8 +33,17 @@ type genericMessage struct {
 	mine       bool
 }
 
+type objectMessage struct {
+	genericMessage
+	object fyne.CanvasObject
+}
+
 func NewMessage(id, senderId, senderName, text string, time time.Time, mine bool) *genericMessage {
 	return &genericMessage{id, senderId, senderName, text, time, mine}
+}
+
+func NewObjectMessage(id, senderId, senderName string, object fyne.CanvasObject, time time.Time, mine bool) *objectMessage {
+	return &objectMessage{genericMessage{id, senderId, senderName, "", time, mine}, object}
 }
 
 func (msg *genericMessage) Id() string {
@@ -48,4 +68,8 @@ func (msg *genericMessage) Time() time.Time {
 
 func (msg *genericMessage) IsMine() bool {
 	return msg.mine
+}
+
+func (msg *objectMessage) Object() fyne.CanvasObject {
+	return msg.object
 }
