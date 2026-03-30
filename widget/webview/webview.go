@@ -30,6 +30,7 @@ func New(w fyne.Window) (web WebView, err error) {
 	}
 
 	web = newWebView(w)
+	//lint:ignore SA4023 on different platforms the view may be nil
 	if web == nil {
 		return web, errors.New("WebView is not supported on current platform")
 	}
