@@ -80,7 +80,7 @@ func newDemoMessageSource(initialSize int) *demoMessageSource {
 	logo.FillMode = canvas.ImageFillContain
 	logo.ScaleMode = canvas.ImageScaleFastest
 	src.msgs = append(src.msgs, chat.NewObjectMessage(
-		fmt.Sprintf("msgid-%03d", initialSize+2),
+		fmt.Sprintf("msgid-%03d", initialSize+1),
 		"sndr-x",
 		"Anyone",
 		logo,
@@ -94,7 +94,7 @@ func newDemoMessageSource(initialSize int) *demoMessageSource {
 		"That",
 	}, nil)
 	src.msgs = append(src.msgs, chat.NewObjectMessage(
-		fmt.Sprintf("msgid-%03d", initialSize+3),
+		fmt.Sprintf("msgid-%03d", initialSize+2),
 		"sndr-x",
 		"Anyone",
 		radio,
@@ -109,7 +109,7 @@ func newDemoMessageSource(initialSize int) *demoMessageSource {
 	)
 	form.OnSubmit = func() {}
 	src.msgs = append(src.msgs, chat.NewObjectMessage(
-		fmt.Sprintf("msgid-%03d", initialSize+4),
+		fmt.Sprintf("msgid-%03d", initialSize+3),
 		"sndr-x",
 		"Anyone",
 		form,
