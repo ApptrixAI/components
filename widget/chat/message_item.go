@@ -34,7 +34,7 @@ func newMessageItem() *messageItem {
 	m.bg.FillColor = theme.ColorForWidget(ColorNameRemoteMessageBackground, m)
 	m.bg.CornerRadius = m.text.MinSize().Height / 6
 
-	m.obj = container.NewStack()
+	m.obj = container.NewPadded()
 	m.obj.Hide()
 
 	m.spacer = widget.NewLabel("")
