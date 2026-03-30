@@ -6,6 +6,8 @@ import (
 	"fyne.io/fyne/v2"
 )
 
+// Message describes a simple text message object with basic information
+// necessary for a graphical representation.
 type Message interface {
 	Id() string
 	SenderId() string
@@ -15,6 +17,8 @@ type Message interface {
 	IsMine() bool
 }
 
+// ObjectMessage describes a message object that returns a fyne.CanvasObject
+// to support rendering of images, links, forms, and more.
 type ObjectMessage interface {
 	Message
 	Object() fyne.CanvasObject
