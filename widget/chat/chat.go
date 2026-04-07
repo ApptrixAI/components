@@ -25,6 +25,9 @@ type Chat struct {
 	// provide a Length and GetMessage method.
 	Source MessageSource `json:"-"`
 
+	// HideNames can be set to disable the display of sender names above chat messages.
+	HideNames bool
+
 	container *fyne.Container
 	follow    *fyne.Container
 	list      *messageList
@@ -68,6 +71,7 @@ func (c *Chat) setup() {
 		msg := c.Source.GetMessage(id)
 
 		item := obj.(*messageItem)
+		item.hideName = c.HideNames
 		item.setMessage(msg)
 
 		c.list.SetItemHeight(id, item.MinSize().Height)

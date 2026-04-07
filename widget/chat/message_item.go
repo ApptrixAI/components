@@ -18,6 +18,7 @@ type messageItem struct {
 	bg        *canvas.Rectangle
 	spacer    fyne.CanvasObject
 	obj       *fyne.Container
+	hideName  bool
 }
 
 func newMessageItem() *messageItem {
@@ -77,6 +78,11 @@ func (m *messageItem) setMessage(msg Message) {
 		m.bg.FillColor = theme.ColorForWidget(ColorNameRemoteMessageBackground, m)
 		m.top.Layout = layout.NewBorderLayout(nil, nil, m.sender, nil)
 		m.container.Layout = layout.NewBorderLayout(m.top, nil, nil, m.spacer)
+	}
+	if m.hideName {
+		m.top.Hide()
+	} else {
+		m.top.Show()
 	}
 	m.bg.Refresh()
 	m.container.Refresh()
