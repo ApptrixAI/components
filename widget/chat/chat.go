@@ -23,7 +23,7 @@ type Chat struct {
 
 	// Source is a simple list-oriented message source that only needs to
 	// provide a Length and GetMessage method.
-	Source MessageSource
+	Source MessageSource `json:"-"`
 
 	container *fyne.Container
 	follow    *fyne.Container

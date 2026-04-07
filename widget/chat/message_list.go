@@ -13,6 +13,8 @@ type messageList struct {
 func newMessageList() *messageList {
 	l := &messageList{}
 	l.ExtendBaseWidget(l)
+
+	l.HideSeparators = true
 	return l
 }
 
