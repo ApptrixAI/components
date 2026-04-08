@@ -53,6 +53,10 @@ func New(source MessageSource, onSubmitted func(string)) *Chat {
 	return c
 }
 
+func (c *Chat) hideNames() bool {
+	return c.HideNames
+}
+
 func (c *Chat) setup() {
 	c.list = newMessageList()
 	c.list.Length = func() int {
@@ -71,7 +75,7 @@ func (c *Chat) setup() {
 		msg := c.Source.GetMessage(id)
 
 		item := obj.(*messageItem)
-		item.hideName = c.HideNames
+		item.hideNames = c.hideNames
 		item.setMessage(msg)
 
 		c.list.SetItemHeight(id, item.MinSize().Height)
