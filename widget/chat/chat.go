@@ -96,11 +96,20 @@ func (c *Chat) setup() {
 		c.list.UnselectAll()
 	}
 
-	c.input = newInput(func() {
-		if fn := c.submit.OnTapped; fn != nil {
-			fn()
-		}
-	})
+	c.input = newInput(
+		func() {
+			if fn := c.submit.OnTapped; fn != nil {
+				fn()
+			}
+		},
+		func() {
+			// The input has flipped between single-line and the
+			// multi-line height — re-run the chat container's layout.
+			if c.container != nil {
+				c.container.Refresh()
+			}
+		},
+	)
 	c.submit = widget.NewButtonWithIcon("", theme.MailSendIcon(), func() {
 		if c.input.Text == "" {
 			return
