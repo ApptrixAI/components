@@ -50,8 +50,8 @@ type webView struct {
 	created bool
 	img     *canvas.Image
 	// Double-buffered frames: back is written by copyFrame, then swapped to front.
-	front   atomic.Pointer[image.NRGBA]
-	back    *image.NRGBA
+	front   atomic.Pointer[image.RGBA]
+	back    *image.RGBA
 	frameCh chan struct{}
 }
 
@@ -93,7 +93,7 @@ func newWebView(_ fyne.Window) *webView {
 			}
 		}()
 
-		w.img = canvas.NewImageFromImage(image.NewNRGBA(image.Rect(0, 0, 1, 1)))
+		w.img = canvas.NewImageFromImage(image.NewRGBA(image.Rect(0, 0, 1, 1)))
 		w.img.ScaleMode = canvas.ImageScaleSmooth
 
 		// Frame-ready goroutine: copies pixels to back buffer, swaps to
@@ -145,7 +145,7 @@ func (w *webView) copyFrame() {
 
 	// Reuse the back buffer if the dimensions haven't changed.
 	if w.back == nil || w.back.Rect.Dx() != width || w.back.Rect.Dy() != height {
-		w.back = image.NewNRGBA(image.Rect(0, 0, width, height))
+		w.back = image.NewRGBA(image.Rect(0, 0, width, height))
 	}
 
 	src := unsafe.Slice((*uint8)(unsafe.Pointer(ptr)), nbytes)
