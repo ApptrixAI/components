@@ -89,10 +89,18 @@ type webView struct {
 	front   atomic.Pointer[image.RGBA]
 	back    *image.RGBA
 	frameCh chan struct{}
+	// closed signals the frame goroutine to stop; finished is closed once it
+	// has exited, so Close can wait before freeing the C instance.
+	closed   chan struct{}
+	finished chan struct{}
 }
 
 func newWebView(_ fyne.Window) *webView {
-	w := &webView{frameCh: make(chan struct{}, 1)}
+	w := &webView{
+		frameCh:  make(chan struct{}, 1),
+		closed:   make(chan struct{}),
+		finished: make(chan struct{}),
+	}
 	w.ExtendBaseWidget(w)
 
 	if !ensureLoop() {
@@ -120,9 +128,15 @@ func newWebView(_ fyne.Window) *webView {
 	// Frame-ready goroutine: copies pixels to back buffer, swaps to
 	// front, then refreshes the image on the Fyne thread.
 	go func() {
+		defer close(w.finished)
 		minInterval := time.Second / 60
 		lastRefresh := time.Time{}
-		for range w.frameCh {
+		for {
+			select {
+			case <-w.closed:
+				return
+			case <-w.frameCh:
+			}
 			now := time.Now()
 			if now.Sub(lastRefresh) < minInterval {
 				continue
@@ -359,9 +373,15 @@ func (w *webView) updateFrame() {
 	if !w.created {
 		return
 	}
+	size := w.Size()
+	// A zero-size resize puts the WPE view surface into a non-rendering state
+	// it does not recover from, so ignore degenerate sizes (e.g. transient
+	// 0x0 layouts inside a DocTabs before the tab is first shown).
+	if size.Width <= 0 || size.Height <= 0 {
+		return
+	}
 	s := w.scale()
 	pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(w)
-	size := w.Size()
 	C.WebView_SetScale(w.inst, C.double(s))
 	C.WebView_SetFrame(w.inst, C.int(pos.X), C.int(pos.Y), C.int(size.Width), C.int(size.Height))
 }
@@ -381,6 +401,25 @@ func (w *webView) Stop()    { C.WebView_Stop(w.inst) }
 
 func (w *webView) Loading() bool {
 	return C.WebView_IsLoading(w.inst) != 0
+}
+
+// Close tears down the underlying web engine and releases its resources.
+// After Close the widget becomes inert; it is safe to call more than once.
+func (w *webView) Close() {
+	if !w.created {
+		return
+	}
+	w.created = false
+
+	// Stop the frame goroutine and wait for it to exit so it can no longer
+	// touch w.inst, then destroy the C instance (which blocks until the loop
+	// thread has finished tearing the view down) and drop the handle.
+	close(w.closed)
+	<-w.finished
+
+	C.WebView_Destroy(w.inst)
+	w.inst = nil
+	w.handle.Delete()
 }
 
 func (w *webView) CurrentURL() *url.URL {
