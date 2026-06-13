@@ -33,6 +33,15 @@ var (
 	views   []*webView
 )
 
+func init() {
+	// The headless WPE view renders entirely offscreen, so the AT-SPI
+	// accessibility bridge has no toplevel to attach to. This avoids libatk-bridge
+	// dereferencing a NULL connection in containers or when XDG_RUNTIME_DIR is unset.
+	if _, set := os.LookupEnv("NO_AT_BRIDGE"); !set {
+		os.Setenv("NO_AT_BRIDGE", "1")
+	}
+}
+
 //export goFrameReady
 func goFrameReady() {
 	viewsMu.Lock()

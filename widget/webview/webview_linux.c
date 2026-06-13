@@ -372,7 +372,11 @@ int WebView_Create(int width, int height)
         return 0;
     }
 
-    _toplevel = wpe_toplevel_headless_new(WPE_DISPLAY_HEADLESS(viewDisplay));
+    _toplevel = wpe_display_create_toplevel(viewDisplay, 1);
+    if (!_toplevel) {
+        fprintf(stderr, "webview_linux: wpe_display_create_toplevel() returned NULL\n");
+        return 0;
+    }
     wpe_toplevel_resize(_toplevel, width, height);
     wpe_view_set_toplevel(_wpeView, _toplevel);
     wpe_view_resized(_wpeView, width, height);
