@@ -2,6 +2,7 @@ package webview // import apptrix.org/components/widget/webview
 
 import (
 	"errors"
+	"image"
 	"net/url"
 
 	"fyne.io/fyne/v2"
@@ -18,6 +19,17 @@ type WebView interface {
 	Load(*url.URL)
 	Loading() bool
 	CurrentURL() *url.URL
+
+	// Title returns the current page title, or "" if none is available.
+	Title() string
+	// Favicon returns the current page favicon, or nil if none is available.
+	Favicon() image.Image
+	// SetOnTitleChanged registers a callback fired when the title changes.
+	// Pass nil to clear it.
+	SetOnTitleChanged(func(title string))
+	// SetOnFaviconChanged registers a callback fired when the favicon changes.
+	// The image may be nil. Pass nil to clear it.
+	SetOnFaviconChanged(func(icon image.Image))
 }
 
 // New returns a new WebView that uses a system library to provide an embedded web widget.

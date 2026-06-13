@@ -31,6 +31,7 @@
 
 #include <wpe/wpe-platform.h>
 #include <wpe/webkit.h>
+#include <jsc/jsc.h>
 
 #include <glib.h>
 #include <gbm.h>
@@ -44,6 +45,8 @@
 /* ── Go callback (exported from the Go package) ──────────────────────── */
 
 extern void goFrameReady(uintptr_t goHandle);
+extern void goTitleChanged(uintptr_t goHandle);
+extern void goFaviconChanged(uintptr_t goHandle);
 
 /* ── Shared, process-wide state ────────────────────────────────────────── */
 
@@ -100,7 +103,50 @@ struct WebViewInstance {
     double          scrollDX;
     double          scrollDY;
     int             scrollPending;
+
+    /* Page metadata: the title (cached from notify::title) and the favicon
+       decoded to RGBA by the page itself (WPE exposes no native favicon API).
+       Both are guarded by metaMu and read out by the Go side on demand. */
+    pthread_mutex_t metaMu;
+    char           *title;
+    uint8_t        *favBuf;   /* RGBA8888, favW*favH*4 bytes, or NULL */
+    int             favW;
+    int             favH;
 };
+
+/* Injected into every top frame at document-end.  WPE has no favicon API, so
+   the page locates its own icon, lets the engine decode whatever format it is
+   (.ico/.png/.svg/.webp), rasterises it to RGBA via a canvas, and posts the
+   pixels back through the "favicon" script message handler.  A MutationObserver
+   re-runs it when the document's icon links change. */
+static const char *FAVICON_SCRIPT =
+"(function(){"
+"  var MAX=64, last=null;"
+"  function pick(){"
+"    var ls=document.querySelectorAll('link[rel~=\"icon\"]'),best=null,bs=-1;"
+"    for(var i=0;i<ls.length;i++){var l=ls[i];if(!l.href)continue;"
+"      var s=0,m=l.sizes&&l.sizes.value&&/(\\d+)x(\\d+)/.exec(l.sizes.value);"
+"      if(m)s=parseInt(m[1],10);if(s>=bs){bs=s;best=l.href;}}"
+"    return best||(location.origin+'/favicon.ico');"
+"  }"
+"  function send(u){"
+"    var img=new Image();img.crossOrigin='anonymous';"
+"    img.onload=function(){try{"
+"      var w=img.naturalWidth||img.width,h=img.naturalHeight||img.height;if(!w||!h)return;"
+"      if(w>MAX||h>MAX){var sc=MAX/Math.max(w,h);w=Math.round(w*sc);h=Math.round(h*sc);}"
+"      var c=document.createElement('canvas');c.width=w;c.height=h;"
+"      var x=c.getContext('2d');x.drawImage(img,0,0,w,h);"
+"      var d=x.getImageData(0,0,w,h).data;"
+"      var b=btoa(String.fromCharCode.apply(null,d));"
+"      window.webkit.messageHandlers.favicon.postMessage(w+' '+h+' '+b);"
+"    }catch(e){}};"
+"    img.src=u;"
+"  }"
+"  function update(){var u=pick();if(u!==last){last=u;send(u);}}"
+"  update();"
+"  try{new MutationObserver(update).observe(document.head||document.documentElement,"
+"    {childList:true,subtree:true,attributes:true,attributeFilter:['href','rel','sizes']});}catch(e){}"
+"})();";
 
 /* ── render_buffer vtable override ──────────────────────────────────────
    Shared across all WPEViewHeadless instances; the owning WebViewInstance
@@ -305,6 +351,64 @@ static void on_web_process_terminated(WebKitWebView *wv,
     webkit_web_view_reload(wv);
 }
 
+/* notify::title — cache the new title and tell Go.  Runs on the loop thread. */
+static void on_notify_title(GObject *obj, GParamSpec *pspec, gpointer data)
+{
+    (void)obj; (void)pspec;
+    WebViewInstance *inst = (WebViewInstance *)data;
+    const char *t = webkit_web_view_get_title(inst->webView);
+
+    pthread_mutex_lock(&inst->metaMu);
+    free(inst->title);
+    inst->title = (t && *t) ? strdup(t) : NULL;
+    pthread_mutex_unlock(&inst->metaMu);
+
+    goTitleChanged(inst->goHandle);
+}
+
+/* "favicon" script message — the page posts "W H base64RGBA"; decode and store
+   the pixels, then tell Go.  Runs on the loop thread. */
+static void on_favicon_message(WebKitUserContentManager *m, JSCValue *value,
+                               gpointer data)
+{
+    (void)m;
+    WebViewInstance *inst = (WebViewInstance *)data;
+    if (!jsc_value_is_string(value))
+        return;
+
+    char *str = jsc_value_to_string(value);
+    if (!str)
+        return;
+
+    char *p = str, *end = NULL;
+    long w = strtol(p, &end, 10);
+    if (end == p) { g_free(str); return; }
+    p = end;
+    long h = strtol(p, &end, 10);
+    if (end == p) { g_free(str); return; }
+    p = end;
+    while (*p == ' ') p++;
+
+    gsize outlen = 0;
+    guchar *rgba = g_base64_decode(p, &outlen);
+    if (rgba && w > 0 && h > 0 && outlen == (gsize)w * (gsize)h * 4) {
+        pthread_mutex_lock(&inst->metaMu);
+        free(inst->favBuf);
+        inst->favBuf = malloc(outlen);
+        if (inst->favBuf) {
+            memcpy(inst->favBuf, rgba, outlen);
+            inst->favW = (int)w;
+            inst->favH = (int)h;
+        }
+        pthread_mutex_unlock(&inst->metaMu);
+        g_free(rgba);
+        goFaviconChanged(inst->goHandle);
+    } else {
+        g_free(rgba);
+    }
+    g_free(str);
+}
+
 /* ── One-time global initialisation (runs on the loop thread) ─────────── */
 
 static int global_init(void)
@@ -408,9 +512,24 @@ static WebViewInstance *instance_create(int width, int height, uintptr_t goHandl
     pthread_mutex_init(&inst->frameMu, NULL);
     pthread_mutex_init(&inst->moveMu, NULL);
     pthread_mutex_init(&inst->scrollMu, NULL);
+    pthread_mutex_init(&inst->metaMu, NULL);
     inst->w        = width;
     inst->h        = height;
     inst->goHandle = goHandle;
+
+    /* User content manager: carries the favicon-reading script and receives
+       the decoded pixels the page posts back. */
+    WebKitUserContentManager *ucm = webkit_user_content_manager_new();
+    webkit_user_content_manager_register_script_message_handler(ucm, "favicon", NULL);
+    g_signal_connect(ucm, "script-message-received::favicon",
+        G_CALLBACK(on_favicon_message), inst);
+    WebKitUserScript *script = webkit_user_script_new(
+        FAVICON_SCRIPT,
+        WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END,
+        NULL, NULL);
+    webkit_user_content_manager_add_script(ucm, script);
+    webkit_user_script_unref(script);
 
     WebKitSettings *settings = webkit_settings_new();
     webkit_settings_set_enable_page_cache(settings, FALSE);
@@ -428,8 +547,10 @@ static WebViewInstance *instance_create(int width, int height, uintptr_t goHandl
     inst->webView = g_object_ref_sink(
         WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
                                      "settings", settings,
+                                     "user-content-manager", ucm,
                                      NULL)));
     g_object_unref(settings);
+    g_object_unref(ucm);   /* the web view now holds the only ref */
     if (!inst->webView) {
         fprintf(stderr, "webview_linux: webkit_web_view_new() failed\n");
         free(inst);
@@ -440,6 +561,10 @@ static WebViewInstance *instance_create(int width, int height, uintptr_t goHandl
        reload the current page to restart the process. */
     g_signal_connect(inst->webView, "web-process-terminated",
         G_CALLBACK(on_web_process_terminated), NULL);
+
+    /* Title changes. */
+    g_signal_connect(inst->webView, "notify::title",
+        G_CALLBACK(on_notify_title), inst);
 
     /* Retrieve the underlying WPEView. */
     inst->wpeView = webkit_web_view_get_wpe_view(inst->webView);
@@ -570,9 +695,17 @@ static gboolean idle_destroy(gpointer data)
     inst->frameBuf = NULL;
     pthread_mutex_unlock(&inst->frameMu);
 
+    pthread_mutex_lock(&inst->metaMu);
+    free(inst->title);
+    inst->title = NULL;
+    free(inst->favBuf);
+    inst->favBuf = NULL;
+    pthread_mutex_unlock(&inst->metaMu);
+
     pthread_mutex_destroy(&inst->frameMu);
     pthread_mutex_destroy(&inst->moveMu);
     pthread_mutex_destroy(&inst->scrollMu);
+    pthread_mutex_destroy(&inst->metaMu);
     free(inst);
 
     pthread_mutex_lock(&a->mu);
@@ -855,6 +988,39 @@ const char *WebView_GetURL(WebViewInstance *inst)
         return "";
     const char *uri = webkit_web_view_get_uri(inst->webView);
     return uri ? uri : "";
+}
+
+/* Returns a newly-allocated copy of the current title (NULL if none); the
+   caller frees it.  Reading the cached value avoids touching the GObject off
+   the loop thread. */
+char *WebView_CopyTitle(WebViewInstance *inst)
+{
+    if (!inst)
+        return NULL;
+    pthread_mutex_lock(&inst->metaMu);
+    char *t = inst->title ? strdup(inst->title) : NULL;
+    pthread_mutex_unlock(&inst->metaMu);
+    return t;
+}
+
+const uint8_t *WebView_LockFavicon(WebViewInstance *inst, int *out_w, int *out_h)
+{
+    if (!inst)
+        return NULL;
+    pthread_mutex_lock(&inst->metaMu);
+    if (!inst->favBuf) {
+        pthread_mutex_unlock(&inst->metaMu);
+        return NULL;
+    }
+    *out_w = inst->favW;
+    *out_h = inst->favH;
+    return inst->favBuf;   /* caller holds metaMu until WebView_UnlockFavicon */
+}
+
+void WebView_UnlockFavicon(WebViewInstance *inst)
+{
+    if (inst)
+        pthread_mutex_unlock(&inst->metaMu);
 }
 
 const uint8_t *WebView_LockFrame(WebViewInstance *inst, int *out_w, int *out_h, int *out_stride)

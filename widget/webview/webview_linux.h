@@ -52,6 +52,16 @@ void WebView_SetDarkMode(WebViewInstance *inst, int dark);
 int         WebView_IsLoading(WebViewInstance *inst);
 const char *WebView_GetURL   (WebViewInstance *inst);
 
+/* Page title.  Returns a newly-allocated copy (NULL if none); the caller frees
+   it.  Updated whenever the goTitleChanged callback fires. */
+char *WebView_CopyTitle(WebViewInstance *inst);
+
+/* Favicon pixels.  WebView_LockFavicon() returns RGBA8888 data and fills out
+   the dimensions, or NULL when no favicon is available.  The caller MUST call
+   WebView_UnlockFavicon() when done.  Updated whenever goFaviconChanged fires. */
+const uint8_t *WebView_LockFavicon  (WebViewInstance *inst, int *out_w, int *out_h);
+void           WebView_UnlockFavicon(WebViewInstance *inst);
+
 /* Input events — dispatched to WPE via g_idle_add.
    button: 1=left, 2=middle, 3=right.
    keyval: XKB/GDK keysym. */

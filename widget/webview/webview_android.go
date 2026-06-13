@@ -11,6 +11,7 @@ package webview
 import "C"
 
 import (
+	"image"
 	"net/url"
 	"runtime"
 	"time"
@@ -163,6 +164,12 @@ func (w *webView) CurrentURL() *url.URL {
 	u, _ := url.Parse(C.GoString(C.WebView_GetURL()))
 	return u
 }
+
+// TODO: title/favicon are not yet wired to the Android WebView on this platform.
+func (w *webView) Title() string                              { return "" }
+func (w *webView) Favicon() image.Image                       { return nil }
+func (w *webView) SetOnTitleChanged(func(title string))       {}
+func (w *webView) SetOnFaviconChanged(func(icon image.Image)) {}
 
 type webViewRenderer struct {
 	view *webView

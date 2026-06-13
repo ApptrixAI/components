@@ -79,6 +79,36 @@ func goFrameReady(h C.uintptr_t) {
 	}
 }
 
+//export goTitleChanged
+func goTitleChanged(h C.uintptr_t) {
+	v, ok := cgo.Handle(h).Value().(*webView)
+	if !ok {
+		return
+	}
+	v.cbMu.Lock()
+	cb := v.onTitleChanged
+	v.cbMu.Unlock()
+	if cb != nil {
+		title := v.Title()
+		fyne.Do(func() { cb(title) })
+	}
+}
+
+//export goFaviconChanged
+func goFaviconChanged(h C.uintptr_t) {
+	v, ok := cgo.Handle(h).Value().(*webView)
+	if !ok {
+		return
+	}
+	v.cbMu.Lock()
+	cb := v.onFaviconChanged
+	v.cbMu.Unlock()
+	if cb != nil {
+		icon := v.Favicon()
+		fyne.Do(func() { cb(icon) })
+	}
+}
+
 type webView struct {
 	widget.BaseWidget
 	created bool
@@ -93,6 +123,11 @@ type webView struct {
 	// has exited, so Close can wait before freeing the C instance.
 	closed   chan struct{}
 	finished chan struct{}
+
+	// cbMu guards the change-notification callbacks.
+	cbMu             sync.Mutex
+	onTitleChanged   func(string)
+	onFaviconChanged func(image.Image)
 }
 
 func newWebView(_ fyne.Window) *webView {
@@ -425,6 +460,55 @@ func (w *webView) Close() {
 func (w *webView) CurrentURL() *url.URL {
 	u, _ := url.Parse(C.GoString(C.WebView_GetURL(w.inst)))
 	return u
+}
+
+// Title returns the current page title, or "" if none/unavailable.
+func (w *webView) Title() string {
+	if !w.created {
+		return ""
+	}
+	cs := C.WebView_CopyTitle(w.inst)
+	if cs == nil {
+		return ""
+	}
+	defer C.free(unsafe.Pointer(cs))
+	return C.GoString(cs)
+}
+
+// Favicon returns the current page favicon as an image, or nil if none is
+// available yet.
+func (w *webView) Favicon() image.Image {
+	if !w.created {
+		return nil
+	}
+	var cw, ch C.int
+	ptr := C.WebView_LockFavicon(w.inst, &cw, &ch)
+	if ptr == nil {
+		return nil
+	}
+	defer C.WebView_UnlockFavicon(w.inst)
+
+	width, height := int(cw), int(ch)
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	src := unsafe.Slice((*uint8)(unsafe.Pointer(ptr)), width*height*4)
+	copy(img.Pix, src)
+	return img
+}
+
+// SetOnTitleChanged registers a callback invoked (on the Fyne goroutine)
+// whenever the page title changes. Pass nil to clear it.
+func (w *webView) SetOnTitleChanged(fn func(title string)) {
+	w.cbMu.Lock()
+	w.onTitleChanged = fn
+	w.cbMu.Unlock()
+}
+
+// SetOnFaviconChanged registers a callback invoked (on the Fyne goroutine)
+// whenever the page favicon changes. The image may be nil. Pass nil to clear it.
+func (w *webView) SetOnFaviconChanged(fn func(icon image.Image)) {
+	w.cbMu.Lock()
+	w.onFaviconChanged = fn
+	w.cbMu.Unlock()
 }
 
 /* ── WidgetRenderer ────────────────────────────────────────────────── */

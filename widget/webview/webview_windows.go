@@ -14,6 +14,7 @@ static inline void WebView_CreateFromUintptr(uintptr_t p) {
 import "C"
 
 import (
+	"image"
 	"net/url"
 	"unsafe"
 
@@ -141,6 +142,12 @@ func (w *webView) CurrentURL() *url.URL {
 	u, _ := url.Parse(C.GoString(C.WebView_GetURL()))
 	return u
 }
+
+// TODO: title/favicon are not yet wired to the WebView2 control on this platform.
+func (w *webView) Title() string                              { return "" }
+func (w *webView) Favicon() image.Image                       { return nil }
+func (w *webView) SetOnTitleChanged(func(title string))       {}
+func (w *webView) SetOnFaviconChanged(func(icon image.Image)) {}
 
 type webViewRenderer struct {
 	view *webView
