@@ -4,13 +4,20 @@
  * webview_linux.c — WPE WebKit 2.50+ headless rendering into a pixel buffer.
  *
  * Architecture:
- *   • WPEDisplayHeadless backs the WebKit web view — no X11/Wayland needed.
+ *   • A single shared GLib main loop (WebView_RunLoop) runs on a dedicated
+ *     Go goroutine and performs one-time global init: a WPEDisplayHeadless,
+ *     a GBM device for de-tiling DMA-BUF frames, and the process-wide
+ *     memory-pressure / cache settings.
+ *   • Each widget is a WebViewInstance: its own WebKitWebView, WPEView,
+ *     toplevel and frame buffer.  Many instances coexist in one process,
+ *     all driven by the shared loop and display.
  *   • WPE delivers each rendered frame via the render_buffer vtable slot.
- *     SHM buffers are read directly; DMA-BUF buffers are de-tiled via GBM
- *     with an explicit workaround for Mesa's gbm_bo_map staging-fd leak.
- *   • A Go goroutine (runtime.LockOSThread) runs the GLib main loop.
- *   • goFrameReady() (exported from Go) is called after each frame copy so the
- *     Go side can refresh the canvas.Image widget.
+ *     The slot lives on the (shared) WPEViewHeadless class, so it is patched
+ *     once; the handler recovers the owning instance from the WPEView's
+ *     object data.  SHM buffers are read directly; DMA-BUF buffers are
+ *     de-tiled via GBM with a workaround for Mesa's gbm_bo_map staging-fd leak.
+ *   • goFrameReady(goHandle) (exported from Go) is called after each frame
+ *     copy so the Go side can refresh the right canvas.Image widget.
  */
 
 #include "webview_linux.h"
@@ -36,14 +43,13 @@
 
 /* ── Go callback (exported from the Go package) ──────────────────────── */
 
-extern void goFrameReady(void);
+extern void goFrameReady(uintptr_t goHandle);
 
-/* ── Global state ────────────────────────────────────────────────────── */
+/* ── Shared, process-wide state ────────────────────────────────────────── */
 
-static WPEDisplay    *_display  = NULL;
-static WPEToplevel   *_toplevel = NULL;
-static WPEView       *_wpeView  = NULL;
-static WebKitWebView *_webView  = NULL;
+static WPEDisplay        *_display = NULL;
+static int                _drmFd   = -1;
+static struct gbm_device *_gbm     = NULL;
 
 /* Original render_buffer vtable method — we chain to it after reading
    pixels so that WPE's internal buffer lifecycle (recycling, fd
@@ -52,40 +58,53 @@ static gboolean (*_orig_render_buffer)(WPEView *, WPEBuffer *,
                                        const WPERectangle *, guint,
                                        GError **) = NULL;
 
-static int _w = 800;
-static int _h = 600;
-
-/* GBM device for importing DMA-BUF frames (de-tiling). */
-static int                _drmFd = -1;
-static struct gbm_device *_gbm   = NULL;
-
-/* No BO cache — each frame does a fresh import/map/copy/unmap/destroy.
-   Caching the BO causes stale frames because GBM snapshots the buffer
-   contents at import time; subsequent GPU writes to the same DMA-BUF
-   are not reflected through the cached BO.
-
-   This works without leaking because we chain to the original
-   render_buffer vtable method, which lets WPE recycle its small buffer
-   pool (~2-3 fds).  Per-frame import+destroy on a recycled fd is
-   lightweight, and gbm_bo_destroy fully cleans up the GEM handle. */
-
-/* ── Frame pixel buffer ──────────────────────────────────────────────── */
-
-static pthread_mutex_t _frameMu     = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t        *_frameBuf    = NULL;
-static int             _frameW      = 0;
-static int             _frameH      = 0;
-static int             _frameStride = 0;
-static int             _frameReady  = 0;
+/* Key under which each WPEView stores a back-pointer to its instance. */
+#define WV_INSTANCE_KEY "wv_instance"
 
 /* Minimum interval between frame copies (microseconds).
    Frames arriving faster than this are returned to WPE immediately
    without the expensive pixel copy. */
 #define FRAME_MIN_INTERVAL_US (1000000 / 60)   /* ~60 fps */
 
-static int64_t _lastFrameTimeUs = 0;
+/* ── Per-instance state ──────────────────────────────────────────────── */
 
-/* ── render_buffer vtable override ──────────────────────────────────── */
+struct WebViewInstance {
+    WebKitWebView *webView;
+    WPEView       *wpeView;
+    WPEToplevel   *toplevel;
+
+    uintptr_t      goHandle;   /* opaque token for goFrameReady */
+
+    int            w;
+    int            h;
+
+    /* Frame pixel buffer (RGBA8888). */
+    pthread_mutex_t frameMu;
+    uint8_t        *frameBuf;
+    int             frameW;
+    int             frameH;
+    int             frameStride;
+    int             frameReady;
+    int64_t         lastFrameTimeUs;
+
+    /* Coalesced mouse-move: only the latest position is dispatched. */
+    pthread_mutex_t moveMu;
+    double          moveX;
+    double          moveY;
+    int             movePending;
+
+    /* Coalesced scroll: accumulate deltas, dispatch once per idle. */
+    pthread_mutex_t scrollMu;
+    double          scrollX;
+    double          scrollY;
+    double          scrollDX;
+    double          scrollDY;
+    int             scrollPending;
+};
+
+/* ── render_buffer vtable override ──────────────────────────────────────
+   Shared across all WPEViewHeadless instances; the owning WebViewInstance
+   is recovered from the view's object data. */
 
 static gboolean our_render_buffer(WPEView            *view,
                                   WPEBuffer          *buffer,
@@ -95,12 +114,22 @@ static gboolean our_render_buffer(WPEView            *view,
 {
     (void)rects; (void)n_rects; (void)error;
 
+    WebViewInstance *inst =
+        (WebViewInstance *)g_object_get_data(G_OBJECT(view), WV_INSTANCE_KEY);
+    if (!inst) {
+        /* No owner (being destroyed) — just recycle the buffer. */
+        if (_orig_render_buffer)
+            return _orig_render_buffer(view, buffer, rects, n_rects, error);
+        wpe_view_buffer_rendered(view, buffer);
+        return TRUE;
+    }
+
     /* Rate-limit: skip the expensive pixel copy if we produced a frame
        recently.  Always release the buffer immediately so WPE can
        reuse it — holding buffers forces the web process to allocate
        new ones, causing unbounded memory growth. */
     int64_t now = g_get_monotonic_time();
-    if (now - _lastFrameTimeUs < FRAME_MIN_INTERVAL_US) {
+    if (now - inst->lastFrameTimeUs < FRAME_MIN_INTERVAL_US) {
         /* Skip pixel copy but still chain to original for buffer recycling. */
         if (_orig_render_buffer)
             return _orig_render_buffer(view, buffer, rects, n_rects, error);
@@ -159,16 +188,16 @@ static gboolean our_render_buffer(WPEView            *view,
         size >= (gsize)h * (gsize)stride)
     {
         int dst_stride = w * 4;
-        pthread_mutex_lock(&_frameMu);
-        if (!_frameBuf || _frameW != w || _frameH != h) {
-            free(_frameBuf);
-            _frameBuf = malloc((gsize)h * (gsize)dst_stride);
+        pthread_mutex_lock(&inst->frameMu);
+        if (!inst->frameBuf || inst->frameW != w || inst->frameH != h) {
+            free(inst->frameBuf);
+            inst->frameBuf = malloc((gsize)h * (gsize)dst_stride);
         }
-        if (_frameBuf) {
+        if (inst->frameBuf) {
             /* BGRA → RGBA swizzle during copy so Go can memcpy directly. */
             for (int y = 0; y < h; y++) {
                 const uint8_t *src_row = pixels + y * stride;
-                uint8_t       *dst_row = _frameBuf + y * dst_stride;
+                uint8_t       *dst_row = inst->frameBuf + y * dst_stride;
                 for (int x = 0; x < w; x++) {
                     dst_row[x*4+0] = src_row[x*4+2]; /* R */
                     dst_row[x*4+1] = src_row[x*4+1]; /* G */
@@ -176,13 +205,13 @@ static gboolean our_render_buffer(WPEView            *view,
                     dst_row[x*4+3] = 255;             /* A — force opaque */
                 }
             }
-            _frameW      = w;
-            _frameH      = h;
-            _frameStride = dst_stride;
-            _frameReady  = 1;
-            _lastFrameTimeUs = now;
+            inst->frameW      = w;
+            inst->frameH      = h;
+            inst->frameStride = dst_stride;
+            inst->frameReady  = 1;
+            inst->lastFrameTimeUs = now;
         }
-        pthread_mutex_unlock(&_frameMu);
+        pthread_mutex_unlock(&inst->frameMu);
     }
 
     if (bo) {
@@ -191,7 +220,7 @@ static gboolean our_render_buffer(WPEView            *view,
         gbm_bo_destroy(bo);
     }
 
-    goFrameReady();
+    goFrameReady(inst->goHandle);
 
     /* Chain to the original WPEViewHeadless render_buffer so that WPE's
        internal buffer pool management (recycling, fd cleanup) works.
@@ -202,54 +231,59 @@ static gboolean our_render_buffer(WPEView            *view,
     return TRUE;
 }
 
-/* ── g_idle_add helpers ──────────────────────────────────────────────── */
+/* ── g_idle_add helpers ──────────────────────────────────────────────────
+   Each runs on the loop thread.  The data pointer carries the target
+   instance (and any extra args). */
+
+typedef struct { WebViewInstance *inst; char *url; } NavigateArgs;
 
 static gboolean idle_navigate(gpointer data)
 {
-    char *url = (char *)data;
-    if (_webView)
-        webkit_web_view_load_uri(_webView, url);
-    free(url);
+    NavigateArgs *a = (NavigateArgs *)data;
+    if (a->inst->webView)
+        webkit_web_view_load_uri(a->inst->webView, a->url);
+    free(a->url);
+    free(a);
     return G_SOURCE_REMOVE;
 }
 
 static gboolean idle_go_back(gpointer data)
 {
-    (void)data;
-    if (_webView) webkit_web_view_go_back(_webView);
+    WebViewInstance *inst = (WebViewInstance *)data;
+    if (inst->webView) webkit_web_view_go_back(inst->webView);
     return G_SOURCE_REMOVE;
 }
 
 static gboolean idle_go_forward(gpointer data)
 {
-    (void)data;
-    if (_webView) webkit_web_view_go_forward(_webView);
+    WebViewInstance *inst = (WebViewInstance *)data;
+    if (inst->webView) webkit_web_view_go_forward(inst->webView);
     return G_SOURCE_REMOVE;
 }
 
 static gboolean idle_reload(gpointer data)
 {
-    (void)data;
-    if (_webView) webkit_web_view_reload(_webView);
+    WebViewInstance *inst = (WebViewInstance *)data;
+    if (inst->webView) webkit_web_view_reload(inst->webView);
     return G_SOURCE_REMOVE;
 }
 
 static gboolean idle_stop(gpointer data)
 {
-    (void)data;
-    if (_webView) webkit_web_view_stop_loading(_webView);
+    WebViewInstance *inst = (WebViewInstance *)data;
+    if (inst->webView) webkit_web_view_stop_loading(inst->webView);
     return G_SOURCE_REMOVE;
 }
 
-typedef struct { int w, h; } SizeArgs;
+typedef struct { WebViewInstance *inst; int w, h; } SizeArgs;
 
 static gboolean idle_set_size(gpointer data)
 {
     SizeArgs *a = (SizeArgs *)data;
-    if (_wpeView)
-        wpe_view_resized(_wpeView, a->w, a->h);
-    if (_toplevel)
-        wpe_toplevel_resize(_toplevel, a->w, a->h);
+    if (a->inst->wpeView)
+        wpe_view_resized(a->inst->wpeView, a->w, a->h);
+    if (a->inst->toplevel)
+        wpe_toplevel_resize(a->inst->toplevel, a->w, a->h);
     free(a);
     return G_SOURCE_REMOVE;
 }
@@ -271,13 +305,10 @@ static void on_web_process_terminated(WebKitWebView *wv,
     webkit_web_view_reload(wv);
 }
 
-/* ── Public C API ────────────────────────────────────────────────────── */
+/* ── One-time global initialisation (runs on the loop thread) ─────────── */
 
-int WebView_Create(int width, int height)
+static int global_init(void)
 {
-    _w = width;
-    _h = height;
-
     GError *error = NULL;
 
     /* Open a DRI render node for GBM so we can de-tile DMA-BUF frames. */
@@ -291,7 +322,7 @@ int WebView_Create(int width, int height)
     if (!_gbm)
         fprintf(stderr, "webview_linux: no GBM device (DMA-BUF frames will be unavailable)\n");
 
-    /* Create and connect the headless display. */
+    /* Create and connect the headless display, shared by every instance. */
     _display = wpe_display_headless_new();
     if (!_display) {
         fprintf(stderr, "webview_linux: wpe_display_headless_new() failed\n");
@@ -327,6 +358,60 @@ int WebView_Create(int width, int height)
         webkit_web_context_get_default(),
         WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER);
 
+    return 1;
+}
+
+/* ── Loop readiness handshake ────────────────────────────────────────── */
+
+static pthread_mutex_t _readyMu   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  _readyCond = PTHREAD_COND_INITIALIZER;
+static int             _ready     = 0;   /* 0 = pending, 1 = ok, -1 = failed */
+
+void WebView_RunLoop(void)
+{
+    int ok = global_init();
+
+    pthread_mutex_lock(&_readyMu);
+    _ready = ok ? 1 : -1;
+    pthread_cond_broadcast(&_readyCond);
+    pthread_mutex_unlock(&_readyMu);
+
+    if (!ok)
+        return;
+
+    /* Run the real GLib main loop so that all GLib/WebKit timers,
+       idle handlers, and — critically — the memory-pressure poller
+       fire on schedule. */
+    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+    g_main_loop_run(loop);          /* blocks forever */
+    g_main_loop_unref(loop);
+}
+
+int WebView_WaitReady(void)
+{
+    pthread_mutex_lock(&_readyMu);
+    while (_ready == 0)
+        pthread_cond_wait(&_readyCond, &_readyMu);
+    int r = _ready;
+    pthread_mutex_unlock(&_readyMu);
+    return r == 1 ? 1 : 0;
+}
+
+/* ── Instance creation (runs on the loop thread) ─────────────────────── */
+
+static WebViewInstance *instance_create(int width, int height, uintptr_t goHandle)
+{
+    WebViewInstance *inst = calloc(1, sizeof *inst);
+    if (!inst)
+        return NULL;
+
+    pthread_mutex_init(&inst->frameMu, NULL);
+    pthread_mutex_init(&inst->moveMu, NULL);
+    pthread_mutex_init(&inst->scrollMu, NULL);
+    inst->w        = width;
+    inst->h        = height;
+    inst->goHandle = goHandle;
+
     WebKitSettings *settings = webkit_settings_new();
     webkit_settings_set_enable_page_cache(settings, FALSE);
     webkit_settings_set_enable_html5_local_storage(settings, FALSE);
@@ -340,106 +425,231 @@ int WebView_Create(int width, int height)
     webkit_settings_set_enable_media_stream(settings, FALSE);
 
     /* Create the WebKitWebView using the primary (headless) display. */
-    _webView = g_object_ref_sink(
+    inst->webView = g_object_ref_sink(
         WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
                                      "settings", settings,
                                      NULL)));
     g_object_unref(settings);
-    if (!_webView) {
+    if (!inst->webView) {
         fprintf(stderr, "webview_linux: webkit_web_view_new() failed\n");
-        return 0;
+        free(inst);
+        return NULL;
     }
 
     /* When the web process crashes or is killed for exceeding memory,
        reload the current page to restart the process. */
-    g_signal_connect(_webView, "web-process-terminated",
+    g_signal_connect(inst->webView, "web-process-terminated",
         G_CALLBACK(on_web_process_terminated), NULL);
 
     /* Retrieve the underlying WPEView. */
-    _wpeView = webkit_web_view_get_wpe_view(_webView);
-    if (!_wpeView) {
+    inst->wpeView = webkit_web_view_get_wpe_view(inst->webView);
+    if (!inst->wpeView) {
         fprintf(stderr, "webview_linux: webkit_web_view_get_wpe_view() returned NULL\n");
-        return 0;
+        g_object_unref(inst->webView);
+        free(inst);
+        return NULL;
     }
+
+    /* Let our_render_buffer find this instance from the view. */
+    g_object_set_data(G_OBJECT(inst->wpeView), WV_INSTANCE_KEY, inst);
 
     /* The WebView may have created its own display internally (different
        pointer from _display).  Always use the view's actual display for the
        toplevel so the pointer-equality assertion in wpe_view_set_toplevel
        is satisfied. */
-    WPEDisplay *viewDisplay = webkit_web_view_get_display(_webView);
+    WPEDisplay *viewDisplay = webkit_web_view_get_display(inst->webView);
     if (!viewDisplay) {
         fprintf(stderr, "webview_linux: webkit_web_view_get_display() returned NULL\n");
-        return 0;
+        g_object_unref(inst->webView);
+        free(inst);
+        return NULL;
     }
 
-    _toplevel = wpe_display_create_toplevel(viewDisplay, 1);
-    if (!_toplevel) {
+    inst->toplevel = wpe_display_create_toplevel(viewDisplay, 1);
+    if (!inst->toplevel) {
         fprintf(stderr, "webview_linux: wpe_display_create_toplevel() returned NULL\n");
-        return 0;
+        g_object_unref(inst->webView);
+        free(inst);
+        return NULL;
     }
-    wpe_toplevel_resize(_toplevel, width, height);
-    wpe_view_set_toplevel(_wpeView, _toplevel);
-    wpe_view_resized(_wpeView, width, height);
+    wpe_toplevel_resize(inst->toplevel, width, height);
+    wpe_view_set_toplevel(inst->wpeView, inst->toplevel);
+    wpe_view_resized(inst->wpeView, width, height);
 
     /* Patch the WPEViewHeadless class vtable to capture rendered frames.
-       Save the original so we can chain to it for proper buffer lifecycle. */
-    _orig_render_buffer = WPE_VIEW_GET_CLASS(_wpeView)->render_buffer;
-    WPE_VIEW_GET_CLASS(_wpeView)->render_buffer = our_render_buffer;
+       The vtable is shared by every instance, so do it only once and save
+       the original so we can chain to it for proper buffer lifecycle. */
+    if (!_orig_render_buffer) {
+        _orig_render_buffer = WPE_VIEW_GET_CLASS(inst->wpeView)->render_buffer;
+        WPE_VIEW_GET_CLASS(inst->wpeView)->render_buffer = our_render_buffer;
+    }
 
     /* Map the view so WPE starts rendering. */
-    wpe_view_map(_wpeView);
+    wpe_view_map(inst->wpeView);
 
-    return 1;
+    return inst;
 }
 
-void WebView_RunLoop(void)
+typedef struct {
+    int             width;
+    int             height;
+    uintptr_t       goHandle;
+    WebViewInstance *result;
+    pthread_mutex_t mu;
+    pthread_cond_t  cond;
+    int             done;
+} CreateArgs;
+
+static gboolean idle_create(gpointer data)
 {
-    /* Run the real GLib main loop so that all GLib/WebKit timers,
-       idle handlers, and — critically — the memory-pressure poller
-       fire on schedule.  The previous approach (pumping the context
-       at 30 Hz from the Fyne thread) starved low-priority sources
-       like GC and tile-cache cleanup whenever rendering was busy. */
-    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
-    g_main_loop_run(loop);          /* blocks forever */
-    g_main_loop_unref(loop);
+    CreateArgs *a = (CreateArgs *)data;
+    WebViewInstance *inst = instance_create(a->width, a->height, a->goHandle);
+
+    pthread_mutex_lock(&a->mu);
+    a->result = inst;
+    a->done   = 1;
+    pthread_cond_signal(&a->cond);
+    pthread_mutex_unlock(&a->mu);
+    return G_SOURCE_REMOVE;
 }
 
-void WebView_SetFrame(int x, int y, int width, int height)
+WebViewInstance *WebView_Create(int width, int height, uintptr_t goHandle)
+{
+    CreateArgs a;
+    a.width    = width;
+    a.height   = height;
+    a.goHandle = goHandle;
+    a.result   = NULL;
+    a.done     = 0;
+    pthread_mutex_init(&a.mu, NULL);
+    pthread_cond_init(&a.cond, NULL);
+
+    /* Create on the loop thread so all GLib/WebKit objects are created and
+       used on the thread that iterates their main context. */
+    g_idle_add(idle_create, &a);
+
+    pthread_mutex_lock(&a.mu);
+    while (!a.done)
+        pthread_cond_wait(&a.cond, &a.mu);
+    WebViewInstance *inst = a.result;
+    pthread_mutex_unlock(&a.mu);
+
+    pthread_mutex_destroy(&a.mu);
+    pthread_cond_destroy(&a.cond);
+    return inst;
+}
+
+/* ── Instance teardown (runs on the loop thread) ─────────────────────── */
+
+typedef struct {
+    WebViewInstance *inst;
+    pthread_mutex_t  mu;
+    pthread_cond_t   cond;
+    int              done;
+} DestroyArgs;
+
+static gboolean idle_destroy(gpointer data)
+{
+    DestroyArgs *a = (DestroyArgs *)data;
+    WebViewInstance *inst = a->inst;
+
+    if (inst->wpeView) {
+        /* Stop frames routing to this instance before we free it. */
+        g_object_set_data(G_OBJECT(inst->wpeView), WV_INSTANCE_KEY, NULL);
+        wpe_view_unmap(inst->wpeView);
+    }
+    if (inst->webView) {
+        g_signal_handlers_disconnect_by_data(inst->webView, NULL);
+        g_object_unref(inst->webView);   /* also disposes its WPEView */
+    }
+    if (inst->toplevel)
+        g_object_unref(inst->toplevel);
+
+    pthread_mutex_lock(&inst->frameMu);
+    free(inst->frameBuf);
+    inst->frameBuf = NULL;
+    pthread_mutex_unlock(&inst->frameMu);
+
+    pthread_mutex_destroy(&inst->frameMu);
+    pthread_mutex_destroy(&inst->moveMu);
+    pthread_mutex_destroy(&inst->scrollMu);
+    free(inst);
+
+    pthread_mutex_lock(&a->mu);
+    a->done = 1;
+    pthread_cond_signal(&a->cond);
+    pthread_mutex_unlock(&a->mu);
+    return G_SOURCE_REMOVE;
+}
+
+void WebView_Destroy(WebViewInstance *inst)
+{
+    if (!inst)
+        return;
+
+    DestroyArgs a;
+    a.inst = inst;
+    a.done = 0;
+    pthread_mutex_init(&a.mu, NULL);
+    pthread_cond_init(&a.cond, NULL);
+
+    g_idle_add(idle_destroy, &a);
+
+    pthread_mutex_lock(&a.mu);
+    while (!a.done)
+        pthread_cond_wait(&a.cond, &a.mu);
+    pthread_mutex_unlock(&a.mu);
+
+    pthread_mutex_destroy(&a.mu);
+    pthread_cond_destroy(&a.cond);
+}
+
+/* ── Geometry ────────────────────────────────────────────────────────── */
+
+void WebView_SetFrame(WebViewInstance *inst, int x, int y, int width, int height)
 {
     (void)x; (void)y;   /* headless has no screen position */
+    if (!inst)
+        return;
 
-    pthread_mutex_lock(&_frameMu);
-    _w = width;
-    _h = height;
-    pthread_mutex_unlock(&_frameMu);
+    pthread_mutex_lock(&inst->frameMu);
+    inst->w = width;
+    inst->h = height;
+    pthread_mutex_unlock(&inst->frameMu);
 
     SizeArgs *a = malloc(sizeof *a);
     if (a) {
-        a->w = width;
-        a->h = height;
+        a->inst = inst;
+        a->w    = width;
+        a->h    = height;
         g_idle_add(idle_set_size, a);
     }
 }
 
-typedef struct { double scale; } ScaleArgs;
+typedef struct { WebViewInstance *inst; double scale; } ScaleArgs;
 
 static gboolean idle_set_scale(gpointer data)
 {
     ScaleArgs *a = (ScaleArgs *)data;
-    if (_toplevel)
-        wpe_toplevel_scale_changed(_toplevel, a->scale);
+    if (a->inst->toplevel)
+        wpe_toplevel_scale_changed(a->inst->toplevel, a->scale);
     free(a);
     return G_SOURCE_REMOVE;
 }
 
-void WebView_SetScale(double scale)
+void WebView_SetScale(WebViewInstance *inst, double scale)
 {
+    if (!inst)
+        return;
     ScaleArgs *a = malloc(sizeof *a);
     if (a) {
+        a->inst  = inst;
         a->scale = scale;
         g_idle_add(idle_set_scale, a);
     }
 }
+
+/* ── Appearance ──────────────────────────────────────────────────────── */
 
 static gboolean idle_set_dark_mode(gpointer data)
 {
@@ -455,151 +665,149 @@ static gboolean idle_set_dark_mode(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
-void WebView_SetDarkMode(int dark)
+void WebView_SetDarkMode(WebViewInstance *inst, int dark)
 {
+    (void)inst;   /* dark mode is a property of the shared display */
     g_idle_add(idle_set_dark_mode, GINT_TO_POINTER(dark));
 }
 
-void WebView_Navigate(const char *url)
+/* ── Navigation ──────────────────────────────────────────────────────── */
+
+void WebView_Navigate(WebViewInstance *inst, const char *url)
 {
-    if (url)
-        g_idle_add(idle_navigate, strdup(url));
+    if (!inst || !url)
+        return;
+    NavigateArgs *a = malloc(sizeof *a);
+    if (a) {
+        a->inst = inst;
+        a->url  = strdup(url);
+        g_idle_add(idle_navigate, a);
+    }
 }
 
-void WebView_GoBack(void)    { g_idle_add(idle_go_back,    NULL); }
-void WebView_GoForward(void) { g_idle_add(idle_go_forward, NULL); }
-void WebView_Reload(void)    { g_idle_add(idle_reload,     NULL); }
-void WebView_Stop(void)      { g_idle_add(idle_stop,       NULL); }
+void WebView_GoBack(WebViewInstance *inst)    { if (inst) g_idle_add(idle_go_back,    inst); }
+void WebView_GoForward(WebViewInstance *inst) { if (inst) g_idle_add(idle_go_forward, inst); }
+void WebView_Reload(WebViewInstance *inst)    { if (inst) g_idle_add(idle_reload,     inst); }
+void WebView_Stop(WebViewInstance *inst)      { if (inst) g_idle_add(idle_stop,       inst); }
 
 /* ── Input events ────────────────────────────────────────────────────── */
 
-typedef struct { double x, y; int button; int down; } MouseBtnArgs;
+typedef struct { WebViewInstance *inst; double x, y; int button; int down; } MouseBtnArgs;
 
 static guint32 _ms_now(void) { return (guint32)(g_get_monotonic_time() / 1000); }
 
 static gboolean idle_mouse_btn(gpointer data)
 {
     MouseBtnArgs *a = data;
-    if (_wpeView) {
+    WPEView *view = a->inst->wpeView;
+    if (view) {
         WPEEvent *ev = wpe_event_pointer_button_new(
             a->down ? WPE_EVENT_POINTER_DOWN : WPE_EVENT_POINTER_UP,
-            _wpeView, WPE_INPUT_SOURCE_MOUSE, _ms_now(),
+            view, WPE_INPUT_SOURCE_MOUSE, _ms_now(),
             0, a->button, a->x, a->y,
-            a->down ? wpe_view_compute_press_count(_wpeView,
+            a->down ? wpe_view_compute_press_count(view,
                           a->x, a->y, a->button, _ms_now()) : 0);
-        wpe_view_event(_wpeView, ev);
+        wpe_view_event(view, ev);
         wpe_event_unref(ev);
     }
     free(a);
     return G_SOURCE_REMOVE;
 }
 
-/* ── Coalesced mouse-move: only the latest position is dispatched ──── */
-
-static pthread_mutex_t _moveMu      = PTHREAD_MUTEX_INITIALIZER;
-static double          _moveX       = 0;
-static double          _moveY       = 0;
-static int             _movePending = 0;
-
 static gboolean idle_mouse_move(gpointer data)
 {
-    (void)data;
-    pthread_mutex_lock(&_moveMu);
-    double x = _moveX;
-    double y = _moveY;
-    _movePending = 0;
-    pthread_mutex_unlock(&_moveMu);
+    WebViewInstance *inst = (WebViewInstance *)data;
+    pthread_mutex_lock(&inst->moveMu);
+    double x = inst->moveX;
+    double y = inst->moveY;
+    inst->movePending = 0;
+    pthread_mutex_unlock(&inst->moveMu);
 
-    if (_wpeView) {
+    if (inst->wpeView) {
         WPEEvent *ev = wpe_event_pointer_move_new(
-            WPE_EVENT_POINTER_MOVE, _wpeView,
+            WPE_EVENT_POINTER_MOVE, inst->wpeView,
             WPE_INPUT_SOURCE_MOUSE, _ms_now(),
             0, x, y, 0, 0);
-        wpe_view_event(_wpeView, ev);
+        wpe_view_event(inst->wpeView, ev);
         wpe_event_unref(ev);
     }
     return G_SOURCE_REMOVE;
 }
-
-/* ── Coalesced scroll: accumulate deltas, dispatch once per idle ──── */
-
-static pthread_mutex_t _scrollMu      = PTHREAD_MUTEX_INITIALIZER;
-static double          _scrollX       = 0;
-static double          _scrollY       = 0;
-static double          _scrollDX      = 0;
-static double          _scrollDY      = 0;
-static int             _scrollPending = 0;
 
 static gboolean idle_scroll(gpointer data)
 {
-    (void)data;
-    pthread_mutex_lock(&_scrollMu);
-    double x  = _scrollX;
-    double y  = _scrollY;
-    double dx = _scrollDX;
-    double dy = _scrollDY;
-    _scrollDX = 0;
-    _scrollDY = 0;
-    _scrollPending = 0;
-    pthread_mutex_unlock(&_scrollMu);
+    WebViewInstance *inst = (WebViewInstance *)data;
+    pthread_mutex_lock(&inst->scrollMu);
+    double x  = inst->scrollX;
+    double y  = inst->scrollY;
+    double dx = inst->scrollDX;
+    double dy = inst->scrollDY;
+    inst->scrollDX = 0;
+    inst->scrollDY = 0;
+    inst->scrollPending = 0;
+    pthread_mutex_unlock(&inst->scrollMu);
 
-    if (_wpeView) {
+    if (inst->wpeView) {
         WPEEvent *ev = wpe_event_scroll_new(
-            _wpeView, WPE_INPUT_SOURCE_MOUSE, _ms_now(),
+            inst->wpeView, WPE_INPUT_SOURCE_MOUSE, _ms_now(),
             0, dx, dy, FALSE, FALSE, x, y);
-        wpe_view_event(_wpeView, ev);
+        wpe_view_event(inst->wpeView, ev);
         wpe_event_unref(ev);
     }
     return G_SOURCE_REMOVE;
 }
 
-void WebView_MouseDown(double x, double y, int button)
+void WebView_MouseDown(WebViewInstance *inst, double x, double y, int button)
 {
+    if (!inst) return;
     MouseBtnArgs *a = malloc(sizeof *a);
-    if (a) { *a = (MouseBtnArgs){x, y, button, 1}; g_idle_add(idle_mouse_btn, a); }
+    if (a) { *a = (MouseBtnArgs){inst, x, y, button, 1}; g_idle_add(idle_mouse_btn, a); }
 }
 
-void WebView_MouseUp(double x, double y, int button)
+void WebView_MouseUp(WebViewInstance *inst, double x, double y, int button)
 {
+    if (!inst) return;
     MouseBtnArgs *a = malloc(sizeof *a);
-    if (a) { *a = (MouseBtnArgs){x, y, button, 0}; g_idle_add(idle_mouse_btn, a); }
+    if (a) { *a = (MouseBtnArgs){inst, x, y, button, 0}; g_idle_add(idle_mouse_btn, a); }
 }
 
-void WebView_MouseMove(double x, double y)
+void WebView_MouseMove(WebViewInstance *inst, double x, double y)
 {
-    pthread_mutex_lock(&_moveMu);
-    _moveX = x;
-    _moveY = y;
-    int was_pending = _movePending;
-    _movePending = 1;
-    pthread_mutex_unlock(&_moveMu);
+    if (!inst) return;
+    pthread_mutex_lock(&inst->moveMu);
+    inst->moveX = x;
+    inst->moveY = y;
+    int was_pending = inst->movePending;
+    inst->movePending = 1;
+    pthread_mutex_unlock(&inst->moveMu);
 
     if (!was_pending)
-        g_idle_add(idle_mouse_move, NULL);
+        g_idle_add(idle_mouse_move, inst);
 }
 
-void WebView_Scroll(double x, double y, double dx, double dy)
+void WebView_Scroll(WebViewInstance *inst, double x, double y, double dx, double dy)
 {
-    pthread_mutex_lock(&_scrollMu);
-    _scrollX   = x;
-    _scrollY   = y;
-    _scrollDX += dx;
-    _scrollDY += dy;
-    int was_pending = _scrollPending;
-    _scrollPending = 1;
-    pthread_mutex_unlock(&_scrollMu);
+    if (!inst) return;
+    pthread_mutex_lock(&inst->scrollMu);
+    inst->scrollX   = x;
+    inst->scrollY   = y;
+    inst->scrollDX += dx;
+    inst->scrollDY += dy;
+    int was_pending = inst->scrollPending;
+    inst->scrollPending = 1;
+    pthread_mutex_unlock(&inst->scrollMu);
 
     if (!was_pending)
-        g_idle_add(idle_scroll, NULL);
+        g_idle_add(idle_scroll, inst);
 }
 
-typedef struct { guint keyval; int down; } KeyArgs;
+typedef struct { WebViewInstance *inst; guint keyval; int down; } KeyArgs;
 
 static gboolean idle_key(gpointer data)
 {
     KeyArgs *a = data;
-    if (_wpeView) {
-        /* Look up the hardware keycode via the display keymap. */
+    if (a->inst->wpeView) {
+        /* Look up the hardware keycode via the shared display keymap. */
         guint keycode = 0;
         WPEKeymap *keymap = wpe_display_get_keymap(_display);
         if (keymap) {
@@ -611,57 +819,62 @@ static gboolean idle_key(gpointer data)
         }
         WPEEvent *ev = wpe_event_keyboard_new(
             a->down ? WPE_EVENT_KEYBOARD_KEY_DOWN : WPE_EVENT_KEYBOARD_KEY_UP,
-            _wpeView, WPE_INPUT_SOURCE_KEYBOARD, _ms_now(),
+            a->inst->wpeView, WPE_INPUT_SOURCE_KEYBOARD, _ms_now(),
             0, keycode, a->keyval);
-        wpe_view_event(_wpeView, ev);
+        wpe_view_event(a->inst->wpeView, ev);
         wpe_event_unref(ev);
     }
     free(a);
     return G_SOURCE_REMOVE;
 }
 
-void WebView_KeyDown(unsigned int keyval)
+void WebView_KeyDown(WebViewInstance *inst, unsigned int keyval)
 {
+    if (!inst) return;
     KeyArgs *a = malloc(sizeof *a);
-    if (a) { *a = (KeyArgs){keyval, 1}; g_idle_add(idle_key, a); }
+    if (a) { *a = (KeyArgs){inst, keyval, 1}; g_idle_add(idle_key, a); }
 }
 
-void WebView_KeyUp(unsigned int keyval)
+void WebView_KeyUp(WebViewInstance *inst, unsigned int keyval)
 {
+    if (!inst) return;
     KeyArgs *a = malloc(sizeof *a);
-    if (a) { *a = (KeyArgs){keyval, 0}; g_idle_add(idle_key, a); }
+    if (a) { *a = (KeyArgs){inst, keyval, 0}; g_idle_add(idle_key, a); }
 }
 
 /* ── State queries ───────────────────────────────────────────────────── */
 
-int WebView_IsLoading(void)
+int WebView_IsLoading(WebViewInstance *inst)
 {
-    return (_webView && webkit_web_view_is_loading(_webView)) ? 1 : 0;
+    return (inst && inst->webView && webkit_web_view_is_loading(inst->webView)) ? 1 : 0;
 }
 
-const char *WebView_GetURL(void)
+const char *WebView_GetURL(WebViewInstance *inst)
 {
-    if (!_webView)
+    if (!inst || !inst->webView)
         return "";
-    const char *uri = webkit_web_view_get_uri(_webView);
+    const char *uri = webkit_web_view_get_uri(inst->webView);
     return uri ? uri : "";
 }
 
-const uint8_t *WebView_LockFrame(int *out_w, int *out_h, int *out_stride)
+const uint8_t *WebView_LockFrame(WebViewInstance *inst, int *out_w, int *out_h, int *out_stride)
 {
-    pthread_mutex_lock(&_frameMu);
-    if (!_frameReady || !_frameBuf) {
-        pthread_mutex_unlock(&_frameMu);
+    if (!inst)
+        return NULL;
+    pthread_mutex_lock(&inst->frameMu);
+    if (!inst->frameReady || !inst->frameBuf) {
+        pthread_mutex_unlock(&inst->frameMu);
         return NULL;
     }
-    _frameReady = 0;    /* mark consumed so we don't re-copy unchanged frames */
-    *out_w      = _frameW;
-    *out_h      = _frameH;
-    *out_stride = _frameStride;
-    return _frameBuf;   /* caller holds _frameMu until WebView_UnlockFrame */
+    inst->frameReady = 0;    /* mark consumed so we don't re-copy unchanged frames */
+    *out_w      = inst->frameW;
+    *out_h      = inst->frameH;
+    *out_stride = inst->frameStride;
+    return inst->frameBuf;   /* caller holds frameMu until WebView_UnlockFrame */
 }
 
-void WebView_UnlockFrame(void)
+void WebView_UnlockFrame(WebViewInstance *inst)
 {
-    pthread_mutex_unlock(&_frameMu);
+    if (inst)
+        pthread_mutex_unlock(&inst->frameMu);
 }

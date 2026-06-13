@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"runtime/cgo"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,9 +29,11 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// The shared GLib main loop is started once for the whole process; every
+// webView instance is created on, and driven by, that single loop.
 var (
-	viewsMu sync.Mutex
-	views   []*webView
+	loopOnce  sync.Once
+	loopReady bool
 )
 
 func init() {
@@ -40,23 +43,47 @@ func init() {
 	if _, set := os.LookupEnv("NO_AT_BRIDGE"); !set {
 		os.Setenv("NO_AT_BRIDGE", "1")
 	}
+
+	// Move JSC's GC signal away from SIGUSR1 (signal 10) which
+	// conflicts with Go's runtime signal handlers. Must be set before
+	// WebKit initialises, so do it once at package load.
+	os.Setenv("JSC_SIGNAL_FOR_GC", "42")
+}
+
+// ensureLoop starts the shared GLib main loop (and one-time global init)
+// exactly once, blocking until initialisation has completed. It reports
+// whether the loop is usable.
+func ensureLoop() bool {
+	loopOnce.Do(func() {
+		// GLib expects the thread that creates the default main context to
+		// be the one that iterates it, so the loop owns a locked OS thread
+		// for its entire life.
+		go func() {
+			runtime.LockOSThread()
+			C.WebView_RunLoop() // performs global init, then blocks forever
+		}()
+		loopReady = C.WebView_WaitReady() != 0
+	})
+	return loopReady
 }
 
 //export goFrameReady
-func goFrameReady() {
-	viewsMu.Lock()
-	defer viewsMu.Unlock()
-	for _, w := range views {
-		select {
-		case w.frameCh <- struct{}{}:
-		default:
-		}
+func goFrameReady(h C.uintptr_t) {
+	v, ok := cgo.Handle(h).Value().(*webView)
+	if !ok {
+		return
+	}
+	select {
+	case v.frameCh <- struct{}{}:
+	default:
 	}
 }
 
 type webView struct {
 	widget.BaseWidget
 	created bool
+	inst    *C.WebViewInstance
+	handle  cgo.Handle
 	img     *canvas.Image
 	// Double-buffered frames: back is written by copyFrame, then swapped to front.
 	front   atomic.Pointer[image.RGBA]
@@ -68,64 +95,49 @@ func newWebView(_ fyne.Window) *webView {
 	w := &webView{frameCh: make(chan struct{}, 1)}
 	w.ExtendBaseWidget(w)
 
-	// Move JSC's GC signal away from SIGUSR1 (signal 10) which
-	// conflicts with Go's runtime signal handlers.
-	os.Setenv("JSC_SIGNAL_FOR_GC", "42")
+	if !ensureLoop() {
+		return w // created == false; methods become no-ops
+	}
 
-	// Create the WebView and run the GLib main loop on the SAME
-	// locked OS thread.  GLib expects the thread that creates the
-	// default main context to be the one that iterates it;
-	// splitting them across threads causes assertion failures.
-	created := make(chan bool, 1)
+	// The handle lets the C frame callback route frames back to this widget.
+	w.handle = cgo.NewHandle(w)
+	w.inst = C.WebView_Create(800, 600, C.uintptr_t(w.handle))
+	if w.inst == nil {
+		w.handle.Delete()
+		return w
+	}
+
+	w.created = true
+	w.syncTheme()
+
+	fyne.CurrentApp().Settings().AddListener(func(fyne.Settings) {
+		fyne.Do(w.syncTheme)
+	})
+
+	w.img = canvas.NewImageFromImage(image.NewRGBA(image.Rect(0, 0, 1, 1)))
+	w.img.ScaleMode = canvas.ImageScaleSmooth
+
+	// Frame-ready goroutine: copies pixels to back buffer, swaps to
+	// front, then refreshes the image on the Fyne thread.
 	go func() {
-		runtime.LockOSThread()
-		ok := C.WebView_Create(800, 600) != 0
-		created <- ok
-		if ok {
-			C.WebView_RunLoop() // blocks forever
+		minInterval := time.Second / 60
+		lastRefresh := time.Time{}
+		for range w.frameCh {
+			now := time.Now()
+			if now.Sub(lastRefresh) < minInterval {
+				continue
+			}
+			w.copyFrame()
+			lastRefresh = time.Now()
+			fyne.Do(func() {
+				if f := w.front.Load(); f != nil {
+					w.img.Image = f
+					w.img.Refresh()
+				}
+			})
 		}
 	}()
 
-	if <-created {
-		w.created = true
-		w.syncTheme()
-
-		viewsMu.Lock()
-		views = append(views, w)
-		viewsMu.Unlock()
-
-		ch := make(chan fyne.Settings)
-		fyne.CurrentApp().Settings().AddChangeListener(ch)
-		go func() {
-			for range ch {
-				fyne.Do(w.syncTheme)
-			}
-		}()
-
-		w.img = canvas.NewImageFromImage(image.NewRGBA(image.Rect(0, 0, 1, 1)))
-		w.img.ScaleMode = canvas.ImageScaleSmooth
-
-		// Frame-ready goroutine: copies pixels to back buffer, swaps to
-		// front, then refreshes the image on the Fyne thread.
-		go func() {
-			minInterval := time.Second / 60
-			lastRefresh := time.Time{}
-			for range w.frameCh {
-				now := time.Now()
-				if now.Sub(lastRefresh) < minInterval {
-					continue
-				}
-				w.copyFrame()
-				lastRefresh = time.Now()
-				fyne.Do(func() {
-					if f := w.front.Load(); f != nil {
-						w.img.Image = f
-						w.img.Refresh()
-					}
-				})
-			}
-		}()
-	}
 	return w
 }
 
@@ -134,7 +146,7 @@ func (w *webView) syncTheme() {
 	if fyne.CurrentApp().Settings().ThemeVariant() == theme.VariantDark {
 		dark = 1
 	}
-	C.WebView_SetDarkMode(C.int(dark))
+	C.WebView_SetDarkMode(w.inst, C.int(dark))
 }
 
 // copyFrame reads the latest RGBA pixels from the C buffer into the back
@@ -142,11 +154,11 @@ func (w *webView) syncTheme() {
 // The C side already performs the BGRA→RGBA swizzle, so this is a straight copy.
 func (w *webView) copyFrame() {
 	var cw, ch, cstride C.int
-	ptr := C.WebView_LockFrame(&cw, &ch, &cstride)
+	ptr := C.WebView_LockFrame(w.inst, &cw, &ch, &cstride)
 	if ptr == nil {
 		return
 	}
-	defer C.WebView_UnlockFrame()
+	defer C.WebView_UnlockFrame(w.inst)
 
 	width := int(cw)
 	height := int(ch)
@@ -198,14 +210,14 @@ func (w *webView) MouseDown(ev *desktop.MouseEvent) {
 	if !w.created {
 		return
 	}
-	C.WebView_MouseDown(C.double(ev.Position.X), C.double(ev.Position.Y), fyneButtonToWPE(ev.Button))
+	C.WebView_MouseDown(w.inst, C.double(ev.Position.X), C.double(ev.Position.Y), fyneButtonToWPE(ev.Button))
 }
 
 func (w *webView) MouseUp(ev *desktop.MouseEvent) {
 	if !w.created {
 		return
 	}
-	C.WebView_MouseUp(C.double(ev.Position.X), C.double(ev.Position.Y), fyneButtonToWPE(ev.Button))
+	C.WebView_MouseUp(w.inst, C.double(ev.Position.X), C.double(ev.Position.Y), fyneButtonToWPE(ev.Button))
 }
 
 func (w *webView) MouseIn(ev *desktop.MouseEvent) {
@@ -216,7 +228,7 @@ func (w *webView) MouseMoved(ev *desktop.MouseEvent) {
 	if !w.created {
 		return
 	}
-	C.WebView_MouseMove(C.double(ev.Position.X), C.double(ev.Position.Y))
+	C.WebView_MouseMove(w.inst, C.double(ev.Position.X), C.double(ev.Position.Y))
 }
 
 func (w *webView) MouseOut() {}
@@ -228,7 +240,7 @@ func (w *webView) Scrolled(ev *fyne.ScrollEvent) {
 	// Fyne reports scroll deltas in large pixel-like units (~10-20 per notch);
 	// WPE non-precise scroll expects small step values (~1 per notch).
 	const scale = 1.0 / 20.0
-	C.WebView_Scroll(C.double(ev.Position.X), C.double(ev.Position.Y),
+	C.WebView_Scroll(w.inst, C.double(ev.Position.X), C.double(ev.Position.Y),
 		C.double(ev.Scrolled.DX*scale), C.double(ev.Scrolled.DY*scale))
 }
 
@@ -303,8 +315,8 @@ func (w *webView) TypedRune(r rune) {
 	} else {
 		keyval = C.uint(r) | 0x01000000
 	}
-	C.WebView_KeyDown(keyval)
-	C.WebView_KeyUp(keyval)
+	C.WebView_KeyDown(w.inst, keyval)
+	C.WebView_KeyUp(w.inst, keyval)
 }
 
 func (w *webView) TypedKey(ev *fyne.KeyEvent) {
@@ -315,8 +327,8 @@ func (w *webView) TypedKey(ev *fyne.KeyEvent) {
 	if !ok {
 		return
 	}
-	C.WebView_KeyDown(C.uint(xk))
-	C.WebView_KeyUp(C.uint(xk))
+	C.WebView_KeyDown(w.inst, C.uint(xk))
+	C.WebView_KeyUp(w.inst, C.uint(xk))
 }
 
 /* ── fyne.Widget interface ─────────────────────────────────────────── */
@@ -350,8 +362,8 @@ func (w *webView) updateFrame() {
 	s := w.scale()
 	pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(w)
 	size := w.Size()
-	C.WebView_SetScale(C.double(s))
-	C.WebView_SetFrame(C.int(pos.X), C.int(pos.Y), C.int(size.Width), C.int(size.Height))
+	C.WebView_SetScale(w.inst, C.double(s))
+	C.WebView_SetFrame(w.inst, C.int(pos.X), C.int(pos.Y), C.int(size.Width), C.int(size.Height))
 }
 
 /* ── WebView interface ─────────────────────────────────────────────── */
@@ -359,20 +371,20 @@ func (w *webView) updateFrame() {
 func (w *webView) Load(u *url.URL) {
 	cs := C.CString(u.String())
 	defer C.free(unsafe.Pointer(cs))
-	C.WebView_Navigate(cs)
+	C.WebView_Navigate(w.inst, cs)
 }
 
-func (w *webView) Back()    { C.WebView_GoBack() }
-func (w *webView) Forward() { C.WebView_GoForward() }
-func (w *webView) Reload()  { C.WebView_Reload() }
-func (w *webView) Stop()    { C.WebView_Stop() }
+func (w *webView) Back()    { C.WebView_GoBack(w.inst) }
+func (w *webView) Forward() { C.WebView_GoForward(w.inst) }
+func (w *webView) Reload()  { C.WebView_Reload(w.inst) }
+func (w *webView) Stop()    { C.WebView_Stop(w.inst) }
 
 func (w *webView) Loading() bool {
-	return C.WebView_IsLoading() != 0
+	return C.WebView_IsLoading(w.inst) != 0
 }
 
 func (w *webView) CurrentURL() *url.URL {
-	u, _ := url.Parse(C.GoString(C.WebView_GetURL()))
+	u, _ := url.Parse(C.GoString(C.WebView_GetURL(w.inst)))
 	return u
 }
 
