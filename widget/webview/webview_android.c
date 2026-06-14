@@ -1,24 +1,60 @@
 #include "webview_android.h"
 #include <android/log.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define TAG "WebViewNative"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+/* ── Process-wide JNI state ────────────────────────────────────────── */
+
 static JavaVM   *_jvm;
 static jobject   _activity;   /* global ref */
-static jobject   _webView;    /* global ref */
-static jobject   _windowMgr;  /* global ref */
 static jclass    _helperCls;  /* global ref to embedded Runnable class */
 static int       _statusBarH; /* status bar height in pixels */
-static char      _currentURL[4096];
-static int       _loading;
+
+/* ── Per-instance state ────────────────────────────────────────────── */
+
+struct WebViewInstance {
+    jobject webView;     /* global ref, NULL until created */
+    jobject windowMgr;   /* global ref, NULL until created */
+    char    currentURL[4096];
+    int     loading;
+    int     createRequested;
+    int     destroyed;
+};
+
+/* ── Instance registry ─────────────────────────────────────────────── */
+
+#define MAX_INSTANCES 32
+static WebViewInstance *_instances[MAX_INSTANCES];
+static int              _instanceCount;
+static pthread_mutex_t  _instMu = PTHREAD_MUTEX_INITIALIZER;
+
+static void register_instance(WebViewInstance *inst) {
+    pthread_mutex_lock(&_instMu);
+    if (_instanceCount < MAX_INSTANCES)
+        _instances[_instanceCount++] = inst;
+    pthread_mutex_unlock(&_instMu);
+}
+
+static void unregister_instance(WebViewInstance *inst) {
+    pthread_mutex_lock(&_instMu);
+    for (int i = 0; i < _instanceCount; i++) {
+        if (_instances[i] == inst) {
+            _instances[i] = _instances[--_instanceCount];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&_instMu);
+}
 
 /* ── Async command queue ──────────────────────────────────────────── */
 
 enum {
     CMD_CREATE = 0,
+    CMD_DESTROY,
     CMD_SET_FRAME,
     CMD_SET_DARK,
     CMD_NAVIGATE,
@@ -29,6 +65,7 @@ enum {
 };
 
 typedef struct {
+    WebViewInstance *inst;
     int type;
     double x, y, w, h;
     int intVal;
@@ -139,8 +176,8 @@ static void enqueue(QEntry *e) {
 
 /* ── UI thread command handlers ───────────────────────────────────── */
 
-static void uiCreateWebView(JNIEnv *env) {
-    if (_webView) return;
+static void uiCreateWebView(JNIEnv *env, WebViewInstance *inst) {
+    if (inst->webView) return;
 
     jclass actCls = (*env)->GetObjectClass(env, _activity);
 
@@ -181,10 +218,10 @@ static void uiCreateWebView(JNIEnv *env) {
         (*env)->DeleteLocalRef(env, actCls);
         return;
     }
-    _windowMgr = (*env)->NewGlobalRef(env, wm);
+    inst->windowMgr = (*env)->NewGlobalRef(env, wm);
     (*env)->DeleteLocalRef(env, wm);
 
-    /* Status bar height for coordinate adjustment */
+    /* Status bar height for coordinate adjustment (process-wide). */
     jmethodID getRes = (*env)->GetMethodID(env, actCls, "getResources",
                                             "()Landroid/content/res/Resources;");
     jobject res = (*env)->CallObjectMethod(env, _activity, getRes);
@@ -210,6 +247,7 @@ static void uiCreateWebView(JNIEnv *env) {
     /* Create WebView */
     jclass wvCls = (*env)->FindClass(env, "android/webkit/WebView");
     if (checkException(env) || !wvCls) {
+        (*env)->DeleteGlobalRef(env, inst->windowMgr); inst->windowMgr = NULL;
         (*env)->DeleteLocalRef(env, token);
         (*env)->DeleteLocalRef(env, actCls);
         return;
@@ -219,12 +257,13 @@ static void uiCreateWebView(JNIEnv *env) {
                                            "(Landroid/content/Context;)V");
     jobject wv = (*env)->NewObject(env, wvCls, wvInit, _activity);
     if (checkException(env) || !wv) {
+        (*env)->DeleteGlobalRef(env, inst->windowMgr); inst->windowMgr = NULL;
         (*env)->DeleteLocalRef(env, wvCls);
         (*env)->DeleteLocalRef(env, token);
         (*env)->DeleteLocalRef(env, actCls);
         return;
     }
-    _webView = (*env)->NewGlobalRef(env, wv);
+    inst->webView = (*env)->NewGlobalRef(env, wv);
     (*env)->DeleteLocalRef(env, wv);
 
     /* WebViewClient keeps navigation inside the WebView */
@@ -235,7 +274,7 @@ static void uiCreateWebView(JNIEnv *env) {
         if (!checkException(env) && wvc) {
             jmethodID setClient = (*env)->GetMethodID(env, wvCls, "setWebViewClient",
                                                        "(Landroid/webkit/WebViewClient;)V");
-            (*env)->CallVoidMethod(env, _webView, setClient, wvc);
+            (*env)->CallVoidMethod(env, inst->webView, setClient, wvc);
             checkException(env);
             (*env)->DeleteLocalRef(env, wvc);
         }
@@ -246,7 +285,7 @@ static void uiCreateWebView(JNIEnv *env) {
     jmethodID getSettings = (*env)->GetMethodID(env, wvCls, "getSettings",
                                                 "()Landroid/webkit/WebSettings;");
     if (!checkException(env) && getSettings) {
-        jobject settings = (*env)->CallObjectMethod(env, _webView, getSettings);
+        jobject settings = (*env)->CallObjectMethod(env, inst->webView, getSettings);
         if (!checkException(env) && settings) {
             jclass sCls = (*env)->GetObjectClass(env, settings);
             jmethodID setJS = (*env)->GetMethodID(env, sCls, "setJavaScriptEnabled", "(Z)V");
@@ -271,7 +310,8 @@ static void uiCreateWebView(JNIEnv *env) {
                                    (jint)(0x8 | 0x20 | 0x01000000),
                                    (jint)-3);
     if (checkException(env) || !lp) {
-        (*env)->DeleteGlobalRef(env, _webView); _webView = NULL;
+        (*env)->DeleteGlobalRef(env, inst->webView); inst->webView = NULL;
+        (*env)->DeleteGlobalRef(env, inst->windowMgr); inst->windowMgr = NULL;
         (*env)->DeleteLocalRef(env, lpCls);
         (*env)->DeleteLocalRef(env, wvCls);
         (*env)->DeleteLocalRef(env, token);
@@ -288,10 +328,10 @@ static void uiCreateWebView(JNIEnv *env) {
     jclass wmCls = (*env)->FindClass(env, "android/view/ViewManager");
     jmethodID addView = (*env)->GetMethodID(env, wmCls, "addView",
                                             "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V");
-    (*env)->CallVoidMethod(env, _windowMgr, addView, _webView, lp);
+    (*env)->CallVoidMethod(env, inst->windowMgr, addView, inst->webView, lp);
     if (checkException(env)) {
-        (*env)->DeleteGlobalRef(env, _webView); _webView = NULL;
-        (*env)->DeleteGlobalRef(env, _windowMgr); _windowMgr = NULL;
+        (*env)->DeleteGlobalRef(env, inst->webView); inst->webView = NULL;
+        (*env)->DeleteGlobalRef(env, inst->windowMgr); inst->windowMgr = NULL;
     }
 
     (*env)->DeleteLocalRef(env, wmCls);
@@ -302,13 +342,48 @@ static void uiCreateWebView(JNIEnv *env) {
     (*env)->DeleteLocalRef(env, actCls);
 }
 
-static void uiSetFrame(JNIEnv *env, double x, double y, double w, double h) {
-    if (!_webView || !_windowMgr) return;
+static void uiDestroyWebView(JNIEnv *env, WebViewInstance *inst) {
+    if (inst->webView) {
+        /* Remove from the window manager, then destroy the WebView so its
+         * web engine resources are released. */
+        if (inst->windowMgr) {
+            jclass wmCls = (*env)->FindClass(env, "android/view/ViewManager");
+            jmethodID removeView = (*env)->GetMethodID(env, wmCls, "removeView",
+                                                       "(Landroid/view/View;)V");
+            (*env)->CallVoidMethod(env, inst->windowMgr, removeView, inst->webView);
+            checkException(env);
+            (*env)->DeleteLocalRef(env, wmCls);
+        }
 
-    jclass viewCls = (*env)->GetObjectClass(env, _webView);
+        jclass wvCls = (*env)->GetObjectClass(env, inst->webView);
+        jmethodID destroy = (*env)->GetMethodID(env, wvCls, "destroy", "()V");
+        if (destroy) (*env)->CallVoidMethod(env, inst->webView, destroy);
+        checkException(env);
+        (*env)->DeleteLocalRef(env, wvCls);
+
+        (*env)->DeleteGlobalRef(env, inst->webView);
+        inst->webView = NULL;
+    }
+    if (inst->windowMgr) {
+        (*env)->DeleteGlobalRef(env, inst->windowMgr);
+        inst->windowMgr = NULL;
+    }
+
+    /* Remove from the refresh registry but intentionally do NOT free(inst):
+       teardown is asynchronous (this runs on the UI thread, later than the
+       caller's WebView_Destroy), and late no-op calls from other goroutines
+       may still dereference inst. It stays marked destroyed and inert; the
+       struct is tiny and bounded by the number of widgets created. */
+    unregister_instance(inst);
+}
+
+static void uiSetFrame(JNIEnv *env, WebViewInstance *inst, double x, double y, double w, double h) {
+    if (!inst->webView || !inst->windowMgr) return;
+
+    jclass viewCls = (*env)->GetObjectClass(env, inst->webView);
     jmethodID getLP = (*env)->GetMethodID(env, viewCls, "getLayoutParams",
                                           "()Landroid/view/ViewGroup$LayoutParams;");
-    jobject lp = (*env)->CallObjectMethod(env, _webView, getLP);
+    jobject lp = (*env)->CallObjectMethod(env, inst->webView, getLP);
     if (checkException(env) || !lp) { (*env)->DeleteLocalRef(env, viewCls); return; }
 
     jclass lpCls = (*env)->FindClass(env, "android/view/WindowManager$LayoutParams");
@@ -320,7 +395,7 @@ static void uiSetFrame(JNIEnv *env, double x, double y, double w, double h) {
     jclass wmCls = (*env)->FindClass(env, "android/view/ViewManager");
     jmethodID updateLP = (*env)->GetMethodID(env, wmCls, "updateViewLayout",
                                               "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V");
-    (*env)->CallVoidMethod(env, _windowMgr, updateLP, _webView, lp);
+    (*env)->CallVoidMethod(env, inst->windowMgr, updateLP, inst->webView, lp);
     checkException(env);
 
     (*env)->DeleteLocalRef(env, wmCls);
@@ -329,50 +404,50 @@ static void uiSetFrame(JNIEnv *env, double x, double y, double w, double h) {
     (*env)->DeleteLocalRef(env, viewCls);
 }
 
-static void uiSetDarkMode(JNIEnv *env, int dark) {
-    if (!_webView) return;
-    jclass cls = (*env)->GetObjectClass(env, _webView);
+static void uiSetDarkMode(JNIEnv *env, WebViewInstance *inst, int dark) {
+    if (!inst->webView) return;
+    jclass cls = (*env)->GetObjectClass(env, inst->webView);
     jmethodID setBg = (*env)->GetMethodID(env, cls, "setBackgroundColor", "(I)V");
-    (*env)->CallVoidMethod(env, _webView, setBg, dark ? (jint)0xFF121212 : (jint)0xFFFFFFFF);
+    (*env)->CallVoidMethod(env, inst->webView, setBg, dark ? (jint)0xFF121212 : (jint)0xFFFFFFFF);
     checkException(env);
     (*env)->DeleteLocalRef(env, cls);
 }
 
-static void uiNavigate(JNIEnv *env, const char *url) {
-    if (!_webView) return;
+static void uiNavigate(JNIEnv *env, WebViewInstance *inst, const char *url) {
+    if (!inst->webView) return;
     jstring jurl = (*env)->NewStringUTF(env, url);
-    jclass cls = (*env)->GetObjectClass(env, _webView);
+    jclass cls = (*env)->GetObjectClass(env, inst->webView);
     jmethodID loadUrl = (*env)->GetMethodID(env, cls, "loadUrl", "(Ljava/lang/String;)V");
-    (*env)->CallVoidMethod(env, _webView, loadUrl, jurl);
+    (*env)->CallVoidMethod(env, inst->webView, loadUrl, jurl);
     checkException(env);
     (*env)->DeleteLocalRef(env, jurl);
     (*env)->DeleteLocalRef(env, cls);
 }
 
-static void uiSimpleCall(JNIEnv *env, const char *method) {
-    if (!_webView) return;
-    jclass cls = (*env)->GetObjectClass(env, _webView);
+static void uiSimpleCall(JNIEnv *env, WebViewInstance *inst, const char *method) {
+    if (!inst->webView) return;
+    jclass cls = (*env)->GetObjectClass(env, inst->webView);
     jmethodID mid = (*env)->GetMethodID(env, cls, method, "()V");
-    (*env)->CallVoidMethod(env, _webView, mid);
+    (*env)->CallVoidMethod(env, inst->webView, mid);
     checkException(env);
     (*env)->DeleteLocalRef(env, cls);
 }
 
-static void uiRefreshState(JNIEnv *env) {
-    if (!_webView) return;
+static void uiRefreshState(JNIEnv *env, WebViewInstance *inst) {
+    if (!inst->webView) return;
 
-    jclass cls = (*env)->GetObjectClass(env, _webView);
+    jclass cls = (*env)->GetObjectClass(env, inst->webView);
 
     jmethodID getProgress = (*env)->GetMethodID(env, cls, "getProgress", "()I");
-    jint progress = (*env)->CallIntMethod(env, _webView, getProgress);
-    if (!checkException(env)) _loading = progress < 100;
+    jint progress = (*env)->CallIntMethod(env, inst->webView, getProgress);
+    if (!checkException(env)) inst->loading = progress < 100;
 
     jmethodID getUrl = (*env)->GetMethodID(env, cls, "getUrl", "()Ljava/lang/String;");
-    jstring jurl = (jstring)(*env)->CallObjectMethod(env, _webView, getUrl);
+    jstring jurl = (jstring)(*env)->CallObjectMethod(env, inst->webView, getUrl);
     if (!checkException(env) && jurl) {
         const char *utf = (*env)->GetStringUTFChars(env, jurl, NULL);
-        strncpy(_currentURL, utf, sizeof(_currentURL) - 1);
-        _currentURL[sizeof(_currentURL) - 1] = '\0';
+        strncpy(inst->currentURL, utf, sizeof(inst->currentURL) - 1);
+        inst->currentURL[sizeof(inst->currentURL) - 1] = '\0';
         (*env)->ReleaseStringUTFChars(env, jurl, utf);
         (*env)->DeleteLocalRef(env, jurl);
     }
@@ -383,6 +458,7 @@ static void uiRefreshState(JNIEnv *env) {
 /* ── nativeRunImpl — called on UI thread by R.run() ──────────────── */
 
 static void JNICALL nativeRunImpl(JNIEnv *env, jclass cls) {
+    (void)cls;
     for (;;) {
         pthread_mutex_lock(&_qMu);
         if (_qHead == _qTail) {
@@ -395,18 +471,28 @@ static void JNICALL nativeRunImpl(JNIEnv *env, jclass cls) {
         pthread_mutex_unlock(&_qMu);
 
         switch (e.type) {
-        case CMD_CREATE:     uiCreateWebView(env); break;
-        case CMD_SET_FRAME:  uiSetFrame(env, e.x, e.y, e.w, e.h); break;
-        case CMD_SET_DARK:   uiSetDarkMode(env, e.intVal); break;
-        case CMD_NAVIGATE:   uiNavigate(env, e.url); break;
-        case CMD_GO_BACK:    uiSimpleCall(env, "goBack"); break;
-        case CMD_GO_FORWARD: uiSimpleCall(env, "goForward"); break;
-        case CMD_RELOAD:     uiSimpleCall(env, "reload"); break;
-        case CMD_STOP:       uiSimpleCall(env, "stopLoading"); break;
+        case CMD_CREATE:     uiCreateWebView(env, e.inst); break;
+        case CMD_DESTROY:    uiDestroyWebView(env, e.inst); break;
+        case CMD_SET_FRAME:  uiSetFrame(env, e.inst, e.x, e.y, e.w, e.h); break;
+        case CMD_SET_DARK:   uiSetDarkMode(env, e.inst, e.intVal); break;
+        case CMD_NAVIGATE:   uiNavigate(env, e.inst, e.url); break;
+        case CMD_GO_BACK:    uiSimpleCall(env, e.inst, "goBack"); break;
+        case CMD_GO_FORWARD: uiSimpleCall(env, e.inst, "goForward"); break;
+        case CMD_RELOAD:     uiSimpleCall(env, e.inst, "reload"); break;
+        case CMD_STOP:       uiSimpleCall(env, e.inst, "stopLoading"); break;
         }
     }
 
-    uiRefreshState(env);
+    /* Refresh state for every live instance.  Snapshot under the registry
+       lock; destroyed instances have already been unregistered above (this
+       runs on the same UI thread), so the snapshot holds no dangling
+       pointers. */
+    pthread_mutex_lock(&_instMu);
+    WebViewInstance *snapshot[MAX_INSTANCES];
+    int n = _instanceCount;
+    for (int i = 0; i < n; i++) snapshot[i] = _instances[i];
+    pthread_mutex_unlock(&_instMu);
+    for (int i = 0; i < n; i++) uiRefreshState(env, snapshot[i]);
 }
 
 /* ── Load embedded DEX and register native method ─────────────────── */
@@ -504,69 +590,89 @@ void WebView_Init(JavaVM *vm, JNIEnv *env, jobject ctx) {
 
     _jvm = vm;
     _activity = (*env)->NewGlobalRef(env, ctx);
-    _currentURL[0] = '\0';
 
     if (!loadHelperClass(env))
         LOGE("WebView_Init: failed to load helper class");
 }
 
-int WebView_TryCreate(void) {
-    if (_webView) return 1;
+WebViewInstance *WebView_New(void) {
+    WebViewInstance *inst = calloc(1, sizeof *inst);
+    if (!inst) return NULL;
+    register_instance(inst);
+    return inst;
+}
+
+int WebView_TryCreate(WebViewInstance *inst) {
+    if (!inst || inst->destroyed) return 0;
+    if (inst->webView) return 1;
     if (!_jvm || !_activity || !_helperCls) return 0;
 
-    QEntry e = { .type = CMD_CREATE };
-    enqueue(&e);
+    if (!inst->createRequested) {
+        QEntry e = { .inst = inst, .type = CMD_CREATE };
+        enqueue(&e);
+        inst->createRequested = 1;
+    }
     return 0;
 }
 
-void WebView_SetFrame(double x, double y, double width, double height) {
-    if (!_webView) return;
-    QEntry e = { .type = CMD_SET_FRAME, .x = x, .y = y, .w = width, .h = height };
+void WebView_Destroy(WebViewInstance *inst) {
+    if (!inst || inst->destroyed) return;
+    /* Mark destroyed first so any concurrent command issuers below bail out
+       before enqueueing work that would reference a freed instance. */
+    inst->destroyed = 1;
+    QEntry e = { .inst = inst, .type = CMD_DESTROY };
     enqueue(&e);
 }
 
-void WebView_SetDarkMode(int dark) {
-    if (!_webView) return;
-    QEntry e = { .type = CMD_SET_DARK, .intVal = dark };
+void WebView_SetFrame(WebViewInstance *inst, double x, double y, double width, double height) {
+    if (!inst || inst->destroyed || !inst->webView) return;
+    QEntry e = { .inst = inst, .type = CMD_SET_FRAME, .x = x, .y = y, .w = width, .h = height };
     enqueue(&e);
 }
 
-void WebView_Navigate(const char *url) {
-    if (!_webView) return;
-    QEntry e = { .type = CMD_NAVIGATE };
+void WebView_SetDarkMode(WebViewInstance *inst, int dark) {
+    if (!inst || inst->destroyed || !inst->webView) return;
+    QEntry e = { .inst = inst, .type = CMD_SET_DARK, .intVal = dark };
+    enqueue(&e);
+}
+
+void WebView_Navigate(WebViewInstance *inst, const char *url) {
+    if (!inst || inst->destroyed || !inst->webView) return;
+    QEntry e = { .inst = inst, .type = CMD_NAVIGATE };
     strncpy(e.url, url, sizeof(e.url) - 1);
     e.url[sizeof(e.url) - 1] = '\0';
     enqueue(&e);
 }
 
-void WebView_GoBack(void) {
-    if (!_webView) return;
-    QEntry e = { .type = CMD_GO_BACK };
+void WebView_GoBack(WebViewInstance *inst) {
+    if (!inst || inst->destroyed || !inst->webView) return;
+    QEntry e = { .inst = inst, .type = CMD_GO_BACK };
     enqueue(&e);
 }
 
-void WebView_GoForward(void) {
-    if (!_webView) return;
-    QEntry e = { .type = CMD_GO_FORWARD };
+void WebView_GoForward(WebViewInstance *inst) {
+    if (!inst || inst->destroyed || !inst->webView) return;
+    QEntry e = { .inst = inst, .type = CMD_GO_FORWARD };
     enqueue(&e);
 }
 
-void WebView_Reload(void) {
-    if (!_webView) return;
-    QEntry e = { .type = CMD_RELOAD };
+void WebView_Reload(WebViewInstance *inst) {
+    if (!inst || inst->destroyed || !inst->webView) return;
+    QEntry e = { .inst = inst, .type = CMD_RELOAD };
     enqueue(&e);
 }
 
-void WebView_Stop(void) {
-    if (!_webView) return;
-    QEntry e = { .type = CMD_STOP };
+void WebView_Stop(WebViewInstance *inst) {
+    if (!inst || inst->destroyed || !inst->webView) return;
+    QEntry e = { .inst = inst, .type = CMD_STOP };
     enqueue(&e);
 }
 
-int WebView_IsLoading(void) {
-    return _loading;
+int WebView_IsLoading(WebViewInstance *inst) {
+    return (inst && !inst->destroyed) ? inst->loading : 0;
 }
 
-const char* WebView_GetURL(void) {
-    return _currentURL[0] ? _currentURL : "";
+const char* WebView_GetURL(WebViewInstance *inst) {
+    if (!inst || inst->destroyed) return "";
+    return inst->currentURL[0] ? inst->currentURL : "";
 }

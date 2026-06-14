@@ -20,6 +20,10 @@ type WebView interface {
 	Loading() bool
 	CurrentURL() *url.URL
 
+	// Close tears down the underlying web engine and releases its resources.
+	// After Close the widget becomes inert; it is safe to call more than once.
+	Close()
+
 	// Title returns the current page title, or "" if none is available.
 	Title() string
 	// Favicon returns the current page favicon, or nil if none is available.

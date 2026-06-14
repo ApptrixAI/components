@@ -5,6 +5,12 @@
  * the DLL not being present.  The WebView2 COM interfaces are called through
  * manually-defined vtable slot indices to avoid a build-time dependency on
  * the WebView2 SDK headers.
+ *
+ * Several WebViewInstance objects may coexist in one process: each owns its
+ * own environment, controller and core web view, along with its own COM
+ * completion/event handlers (which carry a back-pointer to the instance so
+ * navigation state lands on the right view).  The parent HWND is subclassed
+ * once per window (reference-counted) for focus management.
  */
 
 #include "webview_windows.h"
@@ -25,6 +31,7 @@
 /* ICoreWebView2Controller (IUnknown + 23 methods) */
 #define CTL_PUT_BOUNDS        6
 #define CTL_MOVE_FOCUS        12
+#define CTL_CLOSE             24
 #define CTL_GET_COREWEBVIEW2  25
 
 /* ICoreWebView2 (IUnknown + 57 methods) */
@@ -63,15 +70,38 @@ static const GUID IID_NavStartHandler =
 static const GUID IID_NavCompHandler =
     {0xd33a35bf,0x1c49,0x4f98,{0x93,0xab,0x00,0x6e,0x05,0x33,0xfe,0x1c}};
 
-/* ── Global state ────────────────────────────────────────────────────── */
+/* ── Per-instance COM handlers ───────────────────────────────────────── */
 
-static HWND  _parentHwnd  = NULL;
-static void *_environment = NULL;  /* ICoreWebView2Environment* */
-static void *_controller  = NULL;  /* ICoreWebView2Controller*  */
-static void *_webView     = NULL;  /* ICoreWebView2*            */
-static int   _ready       = 0;
-static int   _isLoading   = 0;
-static char  _urlBuf[4096];
+typedef struct WebViewInstance WebViewInstance;
+
+/* A handler is passed to WebView2 as an interface pointer.  The shared
+   vtable arrays (defined below) provide the method implementations; each
+   handler carries a back-pointer to its owning instance so the callback
+   can update the right view's state. */
+typedef struct {
+    void            **lpVtbl;
+    LONG              ref;
+    const GUID       *iid;
+    WebViewInstance  *inst;
+} Handler;
+
+/* ── Per-instance state ──────────────────────────────────────────────── */
+
+struct WebViewInstance {
+    HWND   parentHwnd;
+    void  *environment;  /* ICoreWebView2Environment* */
+    void  *controller;   /* ICoreWebView2Controller*  */
+    void  *webView;      /* ICoreWebView2*            */
+    int    ready;
+    int    isLoading;
+    int    subclassed;   /* this instance attached the parent-HWND subclass */
+    char   urlBuf[4096];
+
+    Handler envCompletedHandler;
+    Handler ctlCompletedHandler;
+    Handler navStartHandler;
+    Handler navCompHandler;
+};
 
 /* ── Parent HWND subclass for focus management ───────────────────────── */
 
@@ -81,11 +111,18 @@ static char  _urlBuf[4096];
  * whole window), so clicking on the Fyne area never reclaims focus.
  * We subclass the parent HWND to return focus on any mouse click in
  * the non-WebView2 area.
+ *
+ * Multiple instances may share a parent window, so the subclass is
+ * installed once per HWND and reference-counted via window properties;
+ * the original WndProc is stored alongside so it can be restored when the
+ * last instance on that window is destroyed.
  */
-static WNDPROC _origWndProc = NULL;
+#define PROP_ORIGPROC  L"FyneWebViewOrigProc"
+#define PROP_REFCOUNT  L"FyneWebViewRefCount"
 
 static LRESULT CALLBACK webviewSubclassProc(
         HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    WNDPROC orig = (WNDPROC)GetPropW(hwnd, PROP_ORIGPROC);
     switch (msg) {
     case WM_LBUTTONDOWN:
     case WM_RBUTTONDOWN:
@@ -93,7 +130,35 @@ static LRESULT CALLBACK webviewSubclassProc(
         SetFocus(hwnd);
         break;
     }
-    return CallWindowProcW(_origWndProc, hwnd, msg, wParam, lParam);
+    if (orig)
+        return CallWindowProcW(orig, hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void subclass_attach(HWND hwnd) {
+    intptr_t count = (intptr_t)GetPropW(hwnd, PROP_REFCOUNT);
+    if (count == 0) {
+        WNDPROC orig = (WNDPROC)SetWindowLongPtrW(
+            hwnd, GWLP_WNDPROC, (LONG_PTR)webviewSubclassProc);
+        SetPropW(hwnd, PROP_ORIGPROC, (HANDLE)orig);
+    }
+    SetPropW(hwnd, PROP_REFCOUNT, (HANDLE)(count + 1));
+}
+
+static void subclass_detach(HWND hwnd) {
+    intptr_t count = (intptr_t)GetPropW(hwnd, PROP_REFCOUNT);
+    if (count <= 0)
+        return;
+    count--;
+    if (count == 0) {
+        WNDPROC orig = (WNDPROC)GetPropW(hwnd, PROP_ORIGPROC);
+        if (orig)
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)orig);
+        RemovePropW(hwnd, PROP_ORIGPROC);
+        RemovePropW(hwnd, PROP_REFCOUNT);
+    } else {
+        SetPropW(hwnd, PROP_REFCOUNT, (HANDLE)count);
+    }
 }
 
 /* ── UTF-8 ↔ UTF-16 helpers ─────────────────────────────────────────── */
@@ -117,12 +182,6 @@ static char *wide_to_utf8(const wchar_t *w) {
 }
 
 /* ── Generic COM callback handler ────────────────────────────────────── */
-
-typedef struct {
-    void       **lpVtbl;
-    LONG         ref;
-    const GUID  *iid;
-} Handler;
 
 static HRESULT STDMETHODCALLTYPE Handler_QueryInterface(
         Handler *this, const GUID *riid, void **ppv) {
@@ -149,7 +208,7 @@ static ULONG STDMETHODCALLTYPE Handler_Release(Handler *this) {
 /* ICoreWebView2NavigationStartingEventArgs::get_Uri — slot 3 */
 #define NAV_ARGS_GET_URI 3
 
-static void cache_url_from_source(void *webview) {
+static void cache_url_from_source(WebViewInstance *inst, void *webview) {
     if (!webview) return;
     wchar_t *wurl = NULL;
     HRESULT hr = ((HRESULT (STDMETHODCALLTYPE *)(void *, wchar_t **))(
@@ -158,8 +217,8 @@ static void cache_url_from_source(void *webview) {
     char *utf8 = wide_to_utf8(wurl);
     CoTaskMemFree(wurl);
     if (utf8) {
-        strncpy(_urlBuf, utf8, sizeof(_urlBuf) - 1);
-        _urlBuf[sizeof(_urlBuf) - 1] = '\0';
+        strncpy(inst->urlBuf, utf8, sizeof(inst->urlBuf) - 1);
+        inst->urlBuf[sizeof(inst->urlBuf) - 1] = '\0';
         free(utf8);
     }
 }
@@ -168,8 +227,9 @@ static void cache_url_from_source(void *webview) {
 
 static HRESULT STDMETHODCALLTYPE NavStart_Invoke(
         Handler *this, void *sender, void *args) {
-    (void)this; (void)sender;
-    _isLoading = 1;
+    (void)sender;
+    WebViewInstance *inst = this->inst;
+    inst->isLoading = 1;
 
     /* Read the target URI from the event args (get_Source on sender
        still returns the old URL at this point). */
@@ -181,8 +241,8 @@ static HRESULT STDMETHODCALLTYPE NavStart_Invoke(
             char *utf8 = wide_to_utf8(wurl);
             CoTaskMemFree(wurl);
             if (utf8) {
-                strncpy(_urlBuf, utf8, sizeof(_urlBuf) - 1);
-                _urlBuf[sizeof(_urlBuf) - 1] = '\0';
+                strncpy(inst->urlBuf, utf8, sizeof(inst->urlBuf) - 1);
+                inst->urlBuf[sizeof(inst->urlBuf) - 1] = '\0';
                 free(utf8);
             }
         }
@@ -193,59 +253,58 @@ static HRESULT STDMETHODCALLTYPE NavStart_Invoke(
 static void *navStartVtbl[] = {
     Handler_QueryInterface, Handler_AddRef, Handler_Release, NavStart_Invoke
 };
-static Handler navStartHandler = { navStartVtbl, 1, &IID_NavStartHandler };
 
 /* ── NavigationCompleted handler ─────────────────────────────────────── */
 
 static HRESULT STDMETHODCALLTYPE NavComp_Invoke(
         Handler *this, void *sender, void *args) {
-    (void)this; (void)args;
-    _isLoading = 0;
+    (void)args;
+    WebViewInstance *inst = this->inst;
+    inst->isLoading = 0;
     /* Update cached URL to the final URL (handles redirects). */
-    cache_url_from_source(sender);
+    cache_url_from_source(inst, sender);
     return S_OK;
 }
 
 static void *navCompVtbl[] = {
     Handler_QueryInterface, Handler_AddRef, Handler_Release, NavComp_Invoke
 };
-static Handler navCompHandler = { navCompVtbl, 1, &IID_NavCompHandler };
 
 /* ── ControllerCompleted handler ─────────────────────────────────────── */
 
 static HRESULT STDMETHODCALLTYPE CtlCompleted_Invoke(
         Handler *this, HRESULT result, void *controller) {
-    (void)this;
+    WebViewInstance *inst = this->inst;
     if (FAILED(result) || !controller) {
         fprintf(stderr, "WebView2: controller creation failed (0x%08lx)\n",
                 result);
-        _ready = 1;
+        inst->ready = 1;
         return S_OK;
     }
 
-    _controller = controller;
+    inst->controller = controller;
     /* AddRef */
     ((ULONG (STDMETHODCALLTYPE *)(void *))(VTBL(controller)[1]))(controller);
 
     /* get_CoreWebView2 */
     HRESULT hr = ((HRESULT (STDMETHODCALLTYPE *)(void *, void **))(
-        VTBL(controller)[CTL_GET_COREWEBVIEW2]))(controller, &_webView);
-    if (FAILED(hr) || !_webView) {
+        VTBL(controller)[CTL_GET_COREWEBVIEW2]))(controller, &inst->webView);
+    if (FAILED(hr) || !inst->webView) {
         fprintf(stderr, "WebView2: get_CoreWebView2 failed (0x%08lx)\n", hr);
-        _ready = 1;
+        inst->ready = 1;
         return S_OK;
     }
 
     /* Register navigation event handlers for IsLoading tracking. */
     long long token;
     ((HRESULT (STDMETHODCALLTYPE *)(void *, void *, long long *))(
-        VTBL(_webView)[WV_ADD_NAV_STARTING]))(_webView, &navStartHandler,
-                                               &token);
+        VTBL(inst->webView)[WV_ADD_NAV_STARTING]))(
+            inst->webView, &inst->navStartHandler, &token);
     ((HRESULT (STDMETHODCALLTYPE *)(void *, void *, long long *))(
-        VTBL(_webView)[WV_ADD_NAV_COMPLETED]))(_webView, &navCompHandler,
-                                                &token);
+        VTBL(inst->webView)[WV_ADD_NAV_COMPLETED]))(
+            inst->webView, &inst->navCompHandler, &token);
 
-    _ready = 1;
+    inst->ready = 1;
     return S_OK;
 }
 
@@ -253,34 +312,31 @@ static void *ctlCompletedVtbl[] = {
     Handler_QueryInterface, Handler_AddRef, Handler_Release,
     CtlCompleted_Invoke
 };
-static Handler ctlCompletedHandler = {
-    ctlCompletedVtbl, 1, &IID_CtlHandler
-};
 
 /* ── EnvironmentCompleted handler ────────────────────────────────────── */
 
 static HRESULT STDMETHODCALLTYPE EnvCompleted_Invoke(
         Handler *this, HRESULT result, void *env) {
-    (void)this;
+    WebViewInstance *inst = this->inst;
     if (FAILED(result) || !env) {
         fprintf(stderr, "WebView2: environment creation failed (0x%08lx)\n",
                 result);
-        _ready = 1;
+        inst->ready = 1;
         return S_OK;
     }
 
-    _environment = env;
+    inst->environment = env;
     /* AddRef */
     ((ULONG (STDMETHODCALLTYPE *)(void *))(VTBL(env)[1]))(env);
 
     /* CreateCoreWebView2Controller(HWND, handler) */
     HRESULT hr = ((HRESULT (STDMETHODCALLTYPE *)(void *, HWND, void *))(
-        VTBL(env)[ENV_CREATE_CONTROLLER]))(env, _parentHwnd,
-                                            &ctlCompletedHandler);
+        VTBL(env)[ENV_CREATE_CONTROLLER]))(env, inst->parentHwnd,
+                                            &inst->ctlCompletedHandler);
     if (FAILED(hr)) {
         fprintf(stderr, "WebView2: CreateController call failed (0x%08lx)\n",
                 hr);
-        _ready = 1;
+        inst->ready = 1;
     }
 
     return S_OK;
@@ -289,9 +345,6 @@ static HRESULT STDMETHODCALLTYPE EnvCompleted_Invoke(
 static void *envCompletedVtbl[] = {
     Handler_QueryInterface, Handler_AddRef, Handler_Release,
     EnvCompleted_Invoke
-};
-static Handler envCompletedHandler = {
-    envCompletedVtbl, 1, &IID_EnvHandler
 };
 
 /* ── WebView2 creation function types ────────────────────────────────── */
@@ -408,9 +461,23 @@ static HMODULE find_webview2_module(void) {
 
 /* ── Public API ──────────────────────────────────────────────────────── */
 
-void WebView_Create(void *hwnd) {
-    if (!hwnd) return;
-    _parentHwnd = (HWND)hwnd;
+WebViewInstance *WebView_Create(void *hwnd) {
+    if (!hwnd) return NULL;
+
+    WebViewInstance *inst = calloc(1, sizeof *inst);
+    if (!inst) return NULL;
+    inst->parentHwnd = (HWND)hwnd;
+
+    /* Wire up the per-instance COM handlers (shared vtables, instance
+       back-pointer). */
+    inst->envCompletedHandler =
+        (Handler){ envCompletedVtbl, 1, &IID_EnvHandler,      inst };
+    inst->ctlCompletedHandler =
+        (Handler){ ctlCompletedVtbl, 1, &IID_CtlHandler,      inst };
+    inst->navStartHandler =
+        (Handler){ navStartVtbl,     1, &IID_NavStartHandler, inst };
+    inst->navCompHandler =
+        (Handler){ navCompVtbl,      1, &IID_NavCompHandler,  inst };
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
@@ -419,7 +486,8 @@ void WebView_Create(void *hwnd) {
         fprintf(stderr,
                 "WebView2: could not find WebView2Loader.dll or "
                 "EmbeddedBrowserWebView.dll\n");
-        return;
+        free(inst);
+        return NULL;
     }
 
     HRESULT hr;
@@ -429,7 +497,7 @@ void WebView_Create(void *hwnd) {
         (CreateWebView2EnvironmentFunc)GetProcAddress(
             loader, "CreateCoreWebView2EnvironmentWithOptions");
     if (createEnv) {
-        hr = createEnv(NULL, NULL, NULL, &envCompletedHandler);
+        hr = createEnv(NULL, NULL, NULL, &inst->envCompletedHandler);
     } else {
         /* Fall back to the runtime-internal export
            (EmbeddedBrowserWebView.dll). */
@@ -440,22 +508,24 @@ void WebView_Create(void *hwnd) {
             fprintf(stderr,
                     "WebView2: no usable creation function found\n");
             FreeLibrary(loader);
-            return;
+            free(inst);
+            return NULL;
         }
-        hr = createInternal(FALSE, 0, NULL, NULL, &envCompletedHandler);
+        hr = createInternal(FALSE, 0, NULL, NULL, &inst->envCompletedHandler);
     }
     if (FAILED(hr)) {
         fprintf(stderr,
                 "WebView2: CreateCoreWebView2EnvironmentWithOptions "
                 "failed (0x%08lx)\n", hr);
-        return;
+        free(inst);
+        return NULL;
     }
 
     /* Pump the message loop until the async creation sequence completes.
        A timeout prevents hanging if something goes wrong. */
     DWORD start = GetTickCount();
     MSG msg;
-    while (!_ready) {
+    while (!inst->ready) {
         if (GetTickCount() - start > 10000) {
             fprintf(stderr, "WebView2: creation timed out\n");
             break;
@@ -468,19 +538,56 @@ void WebView_Create(void *hwnd) {
         }
     }
 
-    /* Subclass the parent HWND so clicks on the Fyne area reclaim
-       keyboard focus from the WebView2 child window. */
-    if (_ready && !_origWndProc) {
-        _origWndProc = (WNDPROC)SetWindowLongPtrW(
-            _parentHwnd, GWLP_WNDPROC, (LONG_PTR)webviewSubclassProc);
+    /* If the core view never came up, there is nothing usable to hand back. */
+    if (!inst->webView) {
+        WebView_Destroy(inst);
+        return NULL;
     }
 
+    /* Subclass the parent HWND so clicks on the Fyne area reclaim
+       keyboard focus from the WebView2 child window. */
+    subclass_attach(inst->parentHwnd);
+    inst->subclassed = 1;
+
     /* Undo the initial focus steal — return focus to GLFW. */
-    SetFocus(_parentHwnd);
+    SetFocus(inst->parentHwnd);
+
+    return inst;
 }
 
-void WebView_SetFrame(double x, double y, double width, double height) {
-    if (!_controller) return;
+void WebView_Destroy(WebViewInstance *inst) {
+    if (!inst) return;
+
+    /* Closing the controller tears down the WebView2 child HWND and the
+       underlying browser process resources for this view. */
+    if (inst->controller) {
+        ((HRESULT (STDMETHODCALLTYPE *)(void *))(
+            VTBL(inst->controller)[CTL_CLOSE]))(inst->controller);
+        ((ULONG (STDMETHODCALLTYPE *)(void *))(
+            VTBL(inst->controller)[2]))(inst->controller); /* Release */
+        inst->controller = NULL;
+    }
+    if (inst->webView) {
+        ((ULONG (STDMETHODCALLTYPE *)(void *))(
+            VTBL(inst->webView)[2]))(inst->webView); /* Release */
+        inst->webView = NULL;
+    }
+    if (inst->environment) {
+        ((ULONG (STDMETHODCALLTYPE *)(void *))(
+            VTBL(inst->environment)[2]))(inst->environment); /* Release */
+        inst->environment = NULL;
+    }
+
+    if (inst->subclassed) {
+        subclass_detach(inst->parentHwnd);
+        inst->subclassed = 0;
+    }
+
+    free(inst);
+}
+
+void WebView_SetFrame(WebViewInstance *inst, double x, double y, double width, double height) {
+    if (!inst || !inst->controller) return;
 
     RECT bounds;
     bounds.left   = (LONG)x;
@@ -489,16 +596,17 @@ void WebView_SetFrame(double x, double y, double width, double height) {
     bounds.bottom = (LONG)(y + height);
 
     ((HRESULT (STDMETHODCALLTYPE *)(void *, RECT))(
-        VTBL(_controller)[CTL_PUT_BOUNDS]))(_controller, bounds);
+        VTBL(inst->controller)[CTL_PUT_BOUNDS]))(inst->controller, bounds);
 }
 
-void WebView_SetDarkMode(int dark) {
+void WebView_SetDarkMode(WebViewInstance *inst, int dark) {
     /* WebView2 follows the OS preferred color scheme by default. */
+    (void)inst;
     (void)dark;
 }
 
-void WebView_Navigate(const char *url) {
-    if (!url || !_webView) return;
+void WebView_Navigate(WebViewInstance *inst, const char *url) {
+    if (!inst || !url || !inst->webView) return;
 
     const char *u = url;
     char buf[4096];
@@ -512,51 +620,51 @@ void WebView_Navigate(const char *url) {
     if (!wurl) return;
 
     ((HRESULT (STDMETHODCALLTYPE *)(void *, LPCWSTR))(
-        VTBL(_webView)[WV_NAVIGATE]))(_webView, wurl);
+        VTBL(inst->webView)[WV_NAVIGATE]))(inst->webView, wurl);
     free(wurl);
 }
 
-void WebView_GoBack(void) {
-    if (_webView)
+void WebView_GoBack(WebViewInstance *inst) {
+    if (inst && inst->webView)
         ((HRESULT (STDMETHODCALLTYPE *)(void *))(
-            VTBL(_webView)[WV_GOBACK]))(_webView);
+            VTBL(inst->webView)[WV_GOBACK]))(inst->webView);
 }
 
-void WebView_GoForward(void) {
-    if (_webView)
+void WebView_GoForward(WebViewInstance *inst) {
+    if (inst && inst->webView)
         ((HRESULT (STDMETHODCALLTYPE *)(void *))(
-            VTBL(_webView)[WV_GOFORWARD]))(_webView);
+            VTBL(inst->webView)[WV_GOFORWARD]))(inst->webView);
 }
 
-void WebView_Reload(void) {
-    if (_webView)
+void WebView_Reload(WebViewInstance *inst) {
+    if (inst && inst->webView)
         ((HRESULT (STDMETHODCALLTYPE *)(void *))(
-            VTBL(_webView)[WV_RELOAD]))(_webView);
+            VTBL(inst->webView)[WV_RELOAD]))(inst->webView);
 }
 
-void WebView_Stop(void) {
-    if (_webView)
+void WebView_Stop(WebViewInstance *inst) {
+    if (inst && inst->webView)
         ((HRESULT (STDMETHODCALLTYPE *)(void *))(
-            VTBL(_webView)[WV_STOP]))(_webView);
+            VTBL(inst->webView)[WV_STOP]))(inst->webView);
 }
 
-int WebView_IsLoading(void) {
-    return _isLoading;
+int WebView_IsLoading(WebViewInstance *inst) {
+    return inst ? inst->isLoading : 0;
 }
 
-const char *WebView_GetURL(void) {
-    return _urlBuf;
+const char *WebView_GetURL(WebViewInstance *inst) {
+    return inst ? inst->urlBuf : "";
 }
 
-void WebView_Focus(void) {
-    if (!_controller) return;
+void WebView_Focus(WebViewInstance *inst) {
+    if (!inst || !inst->controller) return;
     /* COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC = 0 */
     ((HRESULT (STDMETHODCALLTYPE *)(void *, int))(
-        VTBL(_controller)[CTL_MOVE_FOCUS]))(_controller, 0);
+        VTBL(inst->controller)[CTL_MOVE_FOCUS]))(inst->controller, 0);
 }
 
-void WebView_Unfocus(void) {
-    if (!_parentHwnd) return;
+void WebView_Unfocus(WebViewInstance *inst) {
+    if (!inst || !inst->parentHwnd) return;
     /* Return keyboard focus to the parent (Fyne/GLFW) window. */
-    SetFocus(_parentHwnd);
+    SetFocus(inst->parentHwnd);
 }

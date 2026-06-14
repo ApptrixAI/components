@@ -6,56 +6,80 @@
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
 
-static WKWebView *_webView = nil;
-static NSView *_contentView = nil;
+#include <stdlib.h>
 
-void WebView_Create(void *nsWindow) {
-    if (nsWindow == NULL) return;
+/* Each instance owns its WKWebView and a retained reference to the content
+   view it was added to, so it can detach itself on teardown. */
+struct WebViewInstance {
+    WKWebView *webView;
+    NSView    *contentView;
+};
 
+WebViewInstance *WebView_Create(void *nsWindow) {
+    if (nsWindow == NULL) return NULL;
+
+    WebViewInstance *inst = NULL;
     @autoreleasepool {
         NSWindow *window = (__bridge NSWindow *)(nsWindow);
-        _contentView = [window contentView];
-        if (_contentView == nil) return;
+        NSView *contentView = [window contentView];
+        if (contentView == nil) return NULL;
 
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
 
-        _webView = [[WKWebView alloc] initWithFrame:NSZeroRect configuration:config];
-        _webView.autoresizingMask = 0;
-        _webView.allowsBackForwardNavigationGestures = YES;
+        WKWebView *webView = [[WKWebView alloc] initWithFrame:NSZeroRect configuration:config];
+        [config release];
+        webView.autoresizingMask = 0;
+        webView.allowsBackForwardNavigationGestures = YES;
 
-        [_contentView addSubview:_webView];
+        [contentView addSubview:webView];
+
+        inst = calloc(1, sizeof *inst);
+        inst->webView     = webView;             /* keep the +1 from alloc */
+        inst->contentView = [contentView retain];
     }
+    return inst;
 }
 
-void WebView_SetFrame(double x, double y, double width, double height) {
-    if (_webView == nil || _contentView == nil) return;
+void WebView_Destroy(WebViewInstance *inst) {
+    if (inst == NULL) return;
+
+    void (^block)(void) = ^{
+        @autoreleasepool {
+            [inst->webView removeFromSuperview];
+            [inst->webView release];
+            [inst->contentView release];
+        }
+    };
+    if ([NSThread isMainThread]) block();
+    else dispatch_sync(dispatch_get_main_queue(), block);
+
+    free(inst);
+}
+
+void WebView_SetFrame(WebViewInstance *inst, double x, double y, double width, double height) {
+    if (inst == NULL || inst->webView == nil || inst->contentView == nil) return;
 
     // Convert from top-left origin (Fyne) to bottom-left origin (macOS)
-    CGFloat contentHeight = _contentView.bounds.size.height;
+    CGFloat contentHeight = inst->contentView.bounds.size.height;
     NSRect frame = NSMakeRect(x, contentHeight - y - height, width, height);
-    [_webView setFrame:frame];
+    [inst->webView setFrame:frame];
 }
 
-void WebView_SetDarkMode(int dark) {
-    if (_webView == nil) return;
+void WebView_SetDarkMode(WebViewInstance *inst, int dark) {
+    if (inst == NULL || inst->webView == nil) return;
 
     if (dark) {
-        _webView.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+        inst->webView.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
     } else {
-        _webView.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+        inst->webView.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
     }
 }
 
-void WebView_Navigate(const char *url) {
-    if (url == NULL) return;
+void WebView_Navigate(WebViewInstance *inst, const char *url) {
+    if (inst == NULL || inst->webView == nil || url == NULL) return;
     NSString *urlString = [NSString stringWithUTF8String:url];
     if (![urlString hasPrefix:@"http://"] && ![urlString hasPrefix:@"https://"]) {
         urlString = [@"https://" stringByAppendingString:urlString];
-    }
-
-    if (_webView == nil) {
-        NSLog(@"WebView_Navigate: webView is nil");
-        return;
     }
 
     NSURL *nsurl = [NSURL URLWithString:urlString];
@@ -65,33 +89,33 @@ void WebView_Navigate(const char *url) {
     }
 
     NSURLRequest *request = [NSURLRequest requestWithURL:nsurl];
-    [_webView loadRequest:request];
+    [inst->webView loadRequest:request];
 }
 
-void WebView_GoBack(void) {
-    if (_webView != nil) [_webView goBack];
+void WebView_GoBack(WebViewInstance *inst) {
+    if (inst != NULL && inst->webView != nil) [inst->webView goBack];
 }
 
-void WebView_GoForward(void) {
-    if (_webView != nil) [_webView goForward];
+void WebView_GoForward(WebViewInstance *inst) {
+    if (inst != NULL && inst->webView != nil) [inst->webView goForward];
 }
 
-void WebView_Reload(void) {
-    if (_webView != nil) [_webView reload];
+void WebView_Reload(WebViewInstance *inst) {
+    if (inst != NULL && inst->webView != nil) [inst->webView reload];
 }
 
-void WebView_Stop(void) {
-    if (_webView != nil) [_webView stopLoading];
+void WebView_Stop(WebViewInstance *inst) {
+    if (inst != NULL && inst->webView != nil) [inst->webView stopLoading];
 }
 
-int WebView_IsLoading(void) {
-    if (_webView == nil) return 0;
-    return _webView.isLoading ? 1 : 0;
+int WebView_IsLoading(WebViewInstance *inst) {
+    if (inst == NULL || inst->webView == nil) return 0;
+    return inst->webView.isLoading ? 1 : 0;
 }
 
-const char* WebView_GetURL(void) {
-    if (_webView == nil) return "";
-    NSString *url = _webView.URL.absoluteString;
+const char* WebView_GetURL(WebViewInstance *inst) {
+    if (inst == NULL || inst->webView == nil) return "";
+    NSString *url = inst->webView.URL.absoluteString;
     if (url == nil) return "";
     return [url UTF8String];
 }

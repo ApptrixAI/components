@@ -24,14 +24,21 @@ type webView struct {
 	widget.BaseWidget
 	win     fyne.Window
 	created bool
+	inst    *C.WebViewInstance
 }
 
 func newWebView(win fyne.Window) *webView {
 	w := &webView{win: win}
 	w.untilCreated(func() {
-		if C.WebView_Create() == 0 {
+		if w.inst != nil {
+			w.created = true
 			return
 		}
+		inst := C.WebView_Create()
+		if inst == nil {
+			return
+		}
+		w.inst = inst
 		w.updateFrame()
 		w.created = true
 	})
@@ -54,7 +61,7 @@ func (w *webView) syncTheme() {
 	if fyne.CurrentApp().Settings().ThemeVariant() == theme.VariantDark {
 		dark = 1
 	}
-	C.WebView_SetDarkMode(C.int(dark))
+	C.WebView_SetDarkMode(w.inst, C.int(dark))
 }
 
 func (w *webView) CreateRenderer() fyne.WidgetRenderer {
@@ -78,39 +85,50 @@ func (w *webView) updateFrame() {
 
 	pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(w)
 	size := w.Size()
-	C.WebView_SetFrame(C.double(pos.X), C.double(pos.Y), C.double(size.Width), C.double(size.Height))
+	C.WebView_SetFrame(w.inst, C.double(pos.X), C.double(pos.Y), C.double(size.Width), C.double(size.Height))
 }
 
 func (w *webView) Load(url *url.URL) {
 	w.afterCreated(func() {
 		cs := C.CString(url.String())
 		defer C.free(unsafe.Pointer(cs))
-		C.WebView_Navigate(cs)
+		C.WebView_Navigate(w.inst, cs)
 	})
 }
 
 func (w *webView) Back() {
-	C.WebView_GoBack()
+	C.WebView_GoBack(w.inst)
 }
 
 func (w *webView) Forward() {
-	C.WebView_GoForward()
+	C.WebView_GoForward(w.inst)
 }
 
 func (w *webView) Reload() {
-	C.WebView_Reload()
+	C.WebView_Reload(w.inst)
 }
 
 func (w *webView) Stop() {
-	C.WebView_Stop()
+	C.WebView_Stop(w.inst)
 }
 
 func (w *webView) Loading() bool {
-	return C.WebView_IsLoading() != 0
+	return C.WebView_IsLoading(w.inst) != 0
+}
+
+// Close tears down the underlying web engine and releases its resources.
+// After Close the widget becomes inert; it is safe to call more than once.
+func (w *webView) Close() {
+	if !w.created {
+		return
+	}
+	w.created = false
+	C.WebView_Destroy(w.inst)
+	w.inst = nil
 }
 
 func (w *webView) CurrentURL() *url.URL {
-	u, _ := url.Parse(C.GoString(C.WebView_GetURL()))
+	u, _ := url.Parse(C.GoString(C.WebView_GetURL(w.inst)))
 	return u
 }
 

@@ -3,15 +3,26 @@
 
 #include <stddef.h>
 
-void WebView_Create(void *nsWindow);
-void WebView_SetFrame(double x, double y, double width, double height);
-void WebView_SetDarkMode(int dark);
-void WebView_Navigate(const char *url);
-void WebView_GoBack(void);
-void WebView_GoForward(void);
-void WebView_Reload(void);
-void WebView_Stop(void);
-int WebView_IsLoading(void);
-const char* WebView_GetURL(void);
+/* An opaque per-widget web view.  Several instances may coexist in one
+   process — each owns its own WKWebView added as a subview of the window's
+   content view. */
+typedef struct WebViewInstance WebViewInstance;
+
+/* Create a new web view instance as a subview of nsWindow's content view.
+   Returns NULL on failure.  Must be called on the main thread. */
+WebViewInstance *WebView_Create(void *nsWindow);
+
+/* Tear down an instance: remove it from its superview and release it. */
+void WebView_Destroy(WebViewInstance *inst);
+
+void WebView_SetFrame(WebViewInstance *inst, double x, double y, double width, double height);
+void WebView_SetDarkMode(WebViewInstance *inst, int dark);
+void WebView_Navigate(WebViewInstance *inst, const char *url);
+void WebView_GoBack(WebViewInstance *inst);
+void WebView_GoForward(WebViewInstance *inst);
+void WebView_Reload(WebViewInstance *inst);
+void WebView_Stop(WebViewInstance *inst);
+int WebView_IsLoading(WebViewInstance *inst);
+const char* WebView_GetURL(WebViewInstance *inst);
 
 #endif
