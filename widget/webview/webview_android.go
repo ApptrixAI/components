@@ -41,7 +41,7 @@ func newWebView(win fyne.Window) *webView {
 		C.WebView_Init(
 			(*C.JavaVM)(unsafe.Pointer(ac.VM)),
 			(*C.JNIEnv)(unsafe.Pointer(ac.Env)),
-			(C.jobject)(unsafe.Pointer(ac.Ctx)),
+			C.jobject(unsafe.Pointer(ac.Ctx)),
 		)
 	})
 
