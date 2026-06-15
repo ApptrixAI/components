@@ -543,9 +543,12 @@ static WebViewInstance *instance_create(int width, int height, uintptr_t goHandl
     webkit_settings_set_enable_media_capabilities(settings, FALSE);
     webkit_settings_set_enable_media_stream(settings, FALSE);
 
-    /* Create the WebKitWebView using the primary (headless) display. */
+    /* Create the WebKitWebView bound to our shared headless display. Passing
+       "display" explicitly is essential to avoid new displays created at runtime
+       which would lose WPE_SETTING_DARK_MODE etc) */
     inst->webView = g_object_ref_sink(
         WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
+                                     "display", _display,
                                      "settings", settings,
                                      "user-content-manager", ucm,
                                      NULL)));
@@ -578,10 +581,9 @@ static WebViewInstance *instance_create(int width, int height, uintptr_t goHandl
     /* Let our_render_buffer find this instance from the view. */
     g_object_set_data(G_OBJECT(inst->wpeView), WV_INSTANCE_KEY, inst);
 
-    /* The WebView may have created its own display internally (different
-       pointer from _display).  Always use the view's actual display for the
-       toplevel so the pointer-equality assertion in wpe_view_set_toplevel
-       is satisfied. */
+    /* Use the view's actual display for the toplevel so the pointer-equality
+       assertion in wpe_view_set_toplevel is satisfied. Now that we construct
+       the view with "display", this is _display, but query it to stay robust. */
     WPEDisplay *viewDisplay = webkit_web_view_get_display(inst->webView);
     if (!viewDisplay) {
         fprintf(stderr, "webview_linux: webkit_web_view_get_display() returned NULL\n");
