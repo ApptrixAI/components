@@ -3,6 +3,7 @@ package chat
 import (
 	"math"
 	"strings"
+	"unicode"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/driver/desktop"
@@ -25,10 +26,11 @@ type input struct {
 	shiftDown          bool
 	rowsSet            int
 	suppressNextReturn bool
+	autoCapitalize     bool // working around the mobile soft keyboard missing this option
 }
 
 func newInput(submit, resize func()) *input {
-	i := &input{onSubmit: submit, onResize: resize, rowsSet: 1}
+	i := &input{onSubmit: submit, onResize: resize, rowsSet: 1, autoCapitalize: true}
 	i.MultiLine = true
 	i.Wrapping = fyne.TextWrapWord
 	i.ExtendBaseWidget(i)
@@ -150,4 +152,30 @@ func (i *input) TypedKey(key *fyne.KeyEvent) {
 	}
 	i.Entry.TypedKey(key)
 	i.Refresh()
+}
+
+// TypedRune capitalizes the first letter of each sentence if running on mobile
+// and autoCapitalize is et to true. A workaround until we get capitalize for
+// soft keyboard configuration.
+func (i *input) TypedRune(r rune) {
+	if i.autoCapitalize && fyne.CurrentDevice().IsMobile() && unicode.IsLetter(r) && i.atSentenceStart() {
+		r = unicode.ToUpper(r)
+	}
+
+	i.Entry.TypedRune(r)
+}
+
+// atSentenceStart reports whether the cursor sits at the start of a new sentence.
+// This returns true when at the beginning of the text, or after a sentence terminator (. ! ?)
+// or a line break, ignoring spaces in between.
+func (i *input) atSentenceStart() bool {
+	before := strings.TrimRight(i.Text[:i.CursorTextOffset()], " \t")
+	if before == "" {
+		return true
+	}
+	switch before[len(before)-1] {
+	case '.', '!', '?', '\n':
+		return true
+	}
+	return false
 }
