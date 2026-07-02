@@ -11,6 +11,8 @@ import (
 
 type messageItem struct {
 	widget.BaseWidget
+	c *Chat
+
 	container *fyne.Container
 	top       *fyne.Container
 	sender    *widget.Label
@@ -21,15 +23,15 @@ type messageItem struct {
 	hideNames func() bool
 }
 
-func newMessageItem() *messageItem {
-	m := &messageItem{}
+func newMessageItem(c *Chat) *messageItem {
+	m := &messageItem{c: c}
 	m.ExtendBaseWidget(m)
 
 	m.sender = widget.NewLabel("")
 	m.sender.SizeName = theme.SizeNameCaptionText
 	m.text = widget.NewLabel("")
 	m.text.Wrapping = fyne.TextWrapWord
-	m.text.Selectable = true
+	m.text.Selectable = c.Selectable
 
 	m.bg = &canvas.Rectangle{}
 	m.bg.FillColor = theme.ColorForWidget(ColorNameRemoteMessageBackground, m)
@@ -58,6 +60,7 @@ func newMessageItem() *messageItem {
 }
 
 func (m *messageItem) setMessage(msg Message) {
+	m.text.Selectable = m.c.Selectable
 	m.sender.SetText(msg.SenderName())
 
 	if omsg, ok := msg.(ObjectMessage); ok {

@@ -28,6 +28,9 @@ type Chat struct {
 	// HideNames can be set to disable the display of sender names above chat messages.
 	HideNames bool
 
+	// Selectable should be set to true if you want the messages to support text selection.
+	Selectable bool
+
 	container *fyne.Container
 	follow    *fyne.Container
 	list      *messageList
@@ -66,7 +69,7 @@ func (c *Chat) setup() {
 		return c.Source.Length()
 	}
 	c.list.CreateItem = func() fyne.CanvasObject {
-		return newMessageItem()
+		return newMessageItem(c)
 	}
 	c.list.UpdateItem = func(id widget.ListItemID, obj fyne.CanvasObject) {
 		if c.Source == nil {
