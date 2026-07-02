@@ -175,6 +175,9 @@ func (c *Chat) setup() {
 func (c *Chat) Refresh() {
 	c.list.Refresh()
 	c.list.ScrollToBottom()
+
+	c.input.Refresh()
+	c.submit.Refresh()
 }
 
 func (c *Chat) CreateRenderer() fyne.WidgetRenderer {
