@@ -39,8 +39,10 @@ func newWebView(win fyne.Window) *webView {
 			return
 		}
 		w.inst = inst
-		w.updateFrame()
 		w.created = true
+		w.updateFrame()
+		// A view created for a background tab must not steal the front.
+		w.setVisible(w.Visible())
 	})
 	w.ExtendBaseWidget(w)
 	w.syncTheme()
@@ -76,6 +78,30 @@ func (w *webView) Resize(size fyne.Size) {
 func (w *webView) Move(pos fyne.Position) {
 	w.BaseWidget.Move(pos)
 	w.updateFrame()
+}
+
+// Show reveals the native view and raises it above any sibling web views.
+func (w *webView) Show() {
+	w.BaseWidget.Show()
+	w.setVisible(true)
+	w.updateFrame()
+}
+
+// Hide detaches the native view from display.
+func (w *webView) Hide() {
+	w.BaseWidget.Hide()
+	w.setVisible(false)
+}
+
+func (w *webView) setVisible(visible bool) {
+	if !w.created {
+		return
+	}
+	v := C.int(0)
+	if visible {
+		v = 1
+	}
+	C.WebView_SetVisible(w.inst, v)
 }
 
 func (w *webView) updateFrame() {

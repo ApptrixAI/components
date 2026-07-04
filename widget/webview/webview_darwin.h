@@ -16,6 +16,8 @@ WebViewInstance *WebView_Create(void *nsWindow);
 void WebView_Destroy(WebViewInstance *inst);
 
 void WebView_SetFrame(WebViewInstance *inst, double x, double y, double width, double height);
+/* Show or hide the native view.  Showing also raises it above its siblings. */
+void WebView_SetVisible(WebViewInstance *inst, int visible);
 void WebView_SetDarkMode(WebViewInstance *inst, int dark);
 void WebView_Navigate(WebViewInstance *inst, const char *url);
 void WebView_GoBack(WebViewInstance *inst);

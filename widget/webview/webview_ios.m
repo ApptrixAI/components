@@ -102,6 +102,25 @@ void WebView_SetFrame(WebViewInstance *inst, double x, double y, double width, d
     }
 }
 
+void WebView_SetVisible(WebViewInstance *inst, int visible) {
+    if (inst == NULL || inst->webView == nil) return;
+
+    void (^block)(void) = ^{
+        if (inst->webView == nil) return;
+        inst->webView.hidden = visible ? NO : YES;
+        if (visible) {
+            // Raise above other web views (e.g. background tabs) sharing the window.
+            [inst->webView.superview bringSubviewToFront:inst->webView];
+        }
+    };
+
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), block);
+    }
+}
+
 void WebView_SetDarkMode(WebViewInstance *inst, int dark) {
     if (inst == NULL || inst->webView == nil) return;
 

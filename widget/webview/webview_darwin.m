@@ -65,6 +65,18 @@ void WebView_SetFrame(WebViewInstance *inst, double x, double y, double width, d
     [inst->webView setFrame:frame];
 }
 
+void WebView_SetVisible(WebViewInstance *inst, int visible) {
+    if (inst == NULL || inst->webView == nil) return;
+
+    inst->webView.hidden = visible ? NO : YES;
+    if (visible && inst->contentView != nil) {
+        // Re-order (without detaching) so the visible view sits above others.
+        [inst->contentView addSubview:inst->webView
+                           positioned:NSWindowAbove
+                           relativeTo:nil];
+    }
+}
+
 void WebView_SetDarkMode(WebViewInstance *inst, int dark) {
     if (inst == NULL || inst->webView == nil) return;
 
