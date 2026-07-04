@@ -2,6 +2,7 @@
 #if TARGET_OS_OSX
 
 #include "webview_darwin.h"
+#include "webview_apple_meta.h"
 
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
@@ -13,18 +14,24 @@
 struct WebViewInstance {
     WKWebView *webView;
     NSView    *contentView;
+    AppleMeta  meta;
 };
 
-WebViewInstance *WebView_Create(void *nsWindow) {
-    if (nsWindow == NULL) return NULL;
+WebViewInstance *WebView_Create(uintptr_t nsWindow, uintptr_t goHandle) {
+    if (nsWindow == 0) return NULL;
 
     WebViewInstance *inst = NULL;
     @autoreleasepool {
-        NSWindow *window = (__bridge NSWindow *)(nsWindow);
+        NSWindow *window = (__bridge NSWindow *)(void *)nsWindow;
         NSView *contentView = [window contentView];
         if (contentView == nil) return NULL;
 
+        inst = calloc(1, sizeof *inst);
+        AppleMeta_Init(&inst->meta, goHandle);
+
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
+        /* Must be wired into the config before the view is created from it. */
+        FyneMeta_Install(config, &inst->meta);
 
         WKWebView *webView = [[WKWebView alloc] initWithFrame:NSZeroRect configuration:config];
         [config release];
@@ -33,7 +40,6 @@ WebViewInstance *WebView_Create(void *nsWindow) {
 
         [contentView addSubview:webView];
 
-        inst = calloc(1, sizeof *inst);
         inst->webView     = webView;             /* keep the +1 from alloc */
         inst->contentView = [contentView retain];
     }
@@ -45,6 +51,9 @@ void WebView_Destroy(WebViewInstance *inst) {
 
     void (^block)(void) = ^{
         @autoreleasepool {
+            /* Detach the message handler first so no callback can fire into
+               the meta we are about to free. */
+            FyneMeta_Uninstall(inst->webView);
             [inst->webView removeFromSuperview];
             [inst->webView release];
             [inst->contentView release];
@@ -53,6 +62,7 @@ void WebView_Destroy(WebViewInstance *inst) {
     if ([NSThread isMainThread]) block();
     else dispatch_sync(dispatch_get_main_queue(), block);
 
+    AppleMeta_Destroy(&inst->meta);
     free(inst);
 }
 
@@ -130,6 +140,21 @@ const char* WebView_GetURL(WebViewInstance *inst) {
     NSString *url = inst->webView.URL.absoluteString;
     if (url == nil) return "";
     return [url UTF8String];
+}
+
+char *WebView_CopyTitle(WebViewInstance *inst) {
+    if (inst == NULL) return NULL;
+    return AppleMeta_CopyTitle(&inst->meta);
+}
+
+const uint8_t *WebView_LockFavicon(WebViewInstance *inst, int *out_w, int *out_h) {
+    if (inst == NULL) return NULL;
+    return AppleMeta_LockFavicon(&inst->meta, out_w, out_h);
+}
+
+void WebView_UnlockFavicon(WebViewInstance *inst) {
+    if (inst == NULL) return;
+    AppleMeta_UnlockFavicon(&inst->meta);
 }
 
 #endif // TARGET_OS_OSX

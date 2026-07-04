@@ -1,4 +1,5 @@
 #include "webview_ios.h"
+#include "webview_apple_meta.h"
 
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
@@ -16,9 +17,10 @@ static void ensureWebKitLoaded(void) {
 /* Each instance owns its WKWebView, added as a subview of the key window. */
 struct WebViewInstance {
     WKWebView *webView;
+    AppleMeta  meta;
 };
 
-WebViewInstance *WebView_Create(void) {
+WebViewInstance *WebView_Create(uintptr_t goHandle) {
     __block WebViewInstance *inst = NULL;
 
     void (^block)(void) = ^{
@@ -45,17 +47,26 @@ WebViewInstance *WebView_Create(void) {
             WKWebViewConfiguration *config = [[configClass alloc] init];
             if (config == nil) return;
 
+            inst = calloc(1, sizeof *inst);
+            AppleMeta_Init(&inst->meta, goHandle);
+            /* Must be wired into the config before the view is created from it. */
+            FyneMeta_Install(config, &inst->meta);
+
             Class wkClass = NSClassFromString(@"WKWebView");
             WKWebView *webView = (WKWebView *)[[wkClass alloc] initWithFrame:window.bounds configuration:config];
             [config release];
-            if (webView == nil) return;
+            if (webView == nil) {
+                AppleMeta_Destroy(&inst->meta);
+                free(inst);
+                inst = NULL;
+                return;
+            }
 
             webView.autoresizingMask = UIViewAutoresizingNone;
             webView.allowsBackForwardNavigationGestures = YES;
 
             [window addSubview:webView];
 
-            inst = calloc(1, sizeof *inst);
             inst->webView = webView;             /* keep the +1 from alloc */
         }
     };
@@ -74,6 +85,9 @@ void WebView_Destroy(WebViewInstance *inst) {
 
     void (^block)(void) = ^{
         @autoreleasepool {
+            /* Detach the message handler first so no callback can fire into
+               the meta we are about to free. */
+            FyneMeta_Uninstall(inst->webView);
             [inst->webView removeFromSuperview];
             [inst->webView release];
         }
@@ -84,6 +98,7 @@ void WebView_Destroy(WebViewInstance *inst) {
         dispatch_sync(dispatch_get_main_queue(), block);
     }
 
+    AppleMeta_Destroy(&inst->meta);
     free(inst);
 }
 
@@ -217,4 +232,19 @@ const char* WebView_GetURL(WebViewInstance *inst) {
     NSString *url = inst->webView.URL.absoluteString;
     if (url == nil) return "";
     return [url UTF8String];
+}
+
+char *WebView_CopyTitle(WebViewInstance *inst) {
+    if (inst == NULL) return NULL;
+    return AppleMeta_CopyTitle(&inst->meta);
+}
+
+const uint8_t *WebView_LockFavicon(WebViewInstance *inst, int *out_w, int *out_h) {
+    if (inst == NULL) return NULL;
+    return AppleMeta_LockFavicon(&inst->meta, out_w, out_h);
+}
+
+void WebView_UnlockFavicon(WebViewInstance *inst) {
+    if (inst == NULL) return;
+    AppleMeta_UnlockFavicon(&inst->meta);
 }

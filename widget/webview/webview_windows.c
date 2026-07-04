@@ -19,9 +19,15 @@
 #define COBJMACROS
 #include <windows.h>
 #include <objbase.h>
+#include <wincrypt.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+
+/* Exported from Go (see the //export directives in webview_windows.go). */
+extern void goTitleChanged(uintptr_t goHandle);
+extern void goFaviconChanged(uintptr_t goHandle);
 
 /* ── COM vtable slot indices ─────────────────────────────────────────── */
 
@@ -40,10 +46,15 @@
 #define WV_NAVIGATE           5
 #define WV_ADD_NAV_STARTING   7
 #define WV_ADD_NAV_COMPLETED  15
+#define WV_ADD_SCRIPT_ON_DOC  27  /* AddScriptToExecuteOnDocumentCreated */
 #define WV_RELOAD             31
+#define WV_ADD_WEB_MESSAGE    34  /* add_WebMessageReceived */
 #define WV_GOBACK             40
 #define WV_GOFORWARD          41
 #define WV_STOP               43
+
+/* ICoreWebView2WebMessageReceivedEventArgs (IUnknown + 3 methods) */
+#define WVMSG_TRY_GET_STRING  5   /* TryGetWebMessageAsString */
 
 
 /* ── Vtable accessor ─────────────────────────────────────────────────── */
@@ -70,6 +81,49 @@ static const GUID IID_NavStartHandler =
 /* ICoreWebView2NavigationCompletedEventHandler */
 static const GUID IID_NavCompHandler =
     {0xd33a35bf,0x1c49,0x4f98,{0x93,0xab,0x00,0x6e,0x05,0x33,0xfe,0x1c}};
+
+/* ICoreWebView2WebMessageReceivedEventHandler */
+static const GUID IID_WebMsgHandler =
+    {0x57213f19,0x00e6,0x49fa,{0x8e,0x07,0x89,0x8e,0xa0,0x1e,0xcb,0xd2}};
+
+/* The AddScriptToExecuteOnDocumentCreated completion handler is only ever
+   AddRef'd and Invoked by WebView2 (never QueryInterface'd for its own IID),
+   so it advertises IID_IUnknown rather than a hard-coded interface GUID. */
+
+/* Injected at document creation: reports title + favicon (rasterised to RGBA
+   via a <canvas>, base64) through window.chrome.webview.postMessage. Mirrors
+   the WPE/Linux favicon script; WebView2 exposes no favicon API either. */
+static const char *FYNE_META_SCRIPT =
+"(function(){"
+"  var MAX=64, lastIcon=null, lastTitle=null;"
+"  function post(s){try{window.chrome.webview.postMessage(s);}catch(e){}}"
+"  function sendTitle(){var t=document.title||'';if(t!==lastTitle){lastTitle=t;post('T'+t);}}"
+"  function pick(){"
+"    var ls=document.querySelectorAll('link[rel~=\"icon\"]'),best=null,bs=-1;"
+"    for(var i=0;i<ls.length;i++){var l=ls[i];if(!l.href)continue;"
+"      var s=0,m=l.sizes&&l.sizes.value&&/(\\d+)x(\\d+)/.exec(l.sizes.value);"
+"      if(m)s=parseInt(m[1],10);if(s>=bs){bs=s;best=l.href;}}"
+"    return best||(location.origin+'/favicon.ico');"
+"  }"
+"  function sendIcon(u){"
+"    var img=new Image();img.crossOrigin='anonymous';"
+"    img.onload=function(){try{"
+"      var w=img.naturalWidth||img.width,h=img.naturalHeight||img.height;if(!w||!h)return;"
+"      if(w>MAX||h>MAX){var sc=MAX/Math.max(w,h);w=Math.round(w*sc);h=Math.round(h*sc);}"
+"      var c=document.createElement('canvas');c.width=w;c.height=h;"
+"      var x=c.getContext('2d');x.drawImage(img,0,0,w,h);"
+"      var d=x.getImageData(0,0,w,h).data;"
+"      var b=btoa(String.fromCharCode.apply(null,d));"
+"      post('F '+w+' '+h+' '+b);"
+"    }catch(e){}};"
+"    img.src=u;"
+"  }"
+"  function update(){sendTitle();var u=pick();if(u!==lastIcon){lastIcon=u;sendIcon(u);}}"
+"  update();"
+"  try{new MutationObserver(update).observe(document.documentElement,"
+"    {childList:true,subtree:true,characterData:true,attributes:true,"
+"     attributeFilter:['href','rel','sizes']});}catch(e){}"
+"})();";
 
 /* ── Per-instance COM handlers ───────────────────────────────────────── */
 
@@ -98,10 +152,23 @@ struct WebViewInstance {
     int    subclassed;   /* this instance attached the parent-HWND subclass */
     char   urlBuf[4096];
 
+    uintptr_t goHandle;  /* opaque token for goTitleChanged/goFaviconChanged */
+
+    /* Page metadata reported by the injected script, guarded by metaMu and
+       read out by the Go side on demand. WebView2 exposes no favicon API, so
+       the page rasterises its own icon to RGBA (see FYNE_META_SCRIPT). */
+    CRITICAL_SECTION metaMu;
+    char           *title;
+    uint8_t        *favBuf;   /* RGBA8888, favW*favH*4 bytes, or NULL */
+    int             favW;
+    int             favH;
+
     Handler envCompletedHandler;
     Handler ctlCompletedHandler;
     Handler navStartHandler;
     Handler navCompHandler;
+    Handler webMsgHandler;
+    Handler addScriptHandler;
 };
 
 /* ── Parent HWND subclass for focus management ───────────────────────── */
@@ -271,6 +338,88 @@ static void *navCompVtbl[] = {
     Handler_QueryInterface, Handler_AddRef, Handler_Release, NavComp_Invoke
 };
 
+/* ── WebMessageReceived handler (title/favicon from injected script) ──── */
+
+/* Parses a "T<title>" or "F <w> <h> <base64 RGBA>" message and caches it. */
+static void handle_meta_message(WebViewInstance *inst, const wchar_t *wmsg) {
+    char *msg = wide_to_utf8(wmsg);
+    if (!msg) return;
+
+    if (msg[0] == 'T') {
+        EnterCriticalSection(&inst->metaMu);
+        free(inst->title);
+        inst->title = (msg[1] != '\0') ? strdup(msg + 1) : NULL;
+        LeaveCriticalSection(&inst->metaMu);
+        free(msg);
+        goTitleChanged(inst->goHandle);
+        return;
+    }
+
+    if (msg[0] == 'F') {
+        char *p = msg + 1, *end = NULL;
+        long w = strtol(p, &end, 10);
+        if (end == p) { free(msg); return; }
+        p = end;
+        long h = strtol(p, &end, 10);
+        if (end == p) { free(msg); return; }
+        p = end;
+        while (*p == ' ') p++;
+
+        DWORD binLen = 0;
+        if (w > 0 && h > 0 &&
+            CryptStringToBinaryA(p, 0, CRYPT_STRING_BASE64, NULL, &binLen, NULL, NULL) &&
+            binLen == (DWORD)(w * h * 4)) {
+            uint8_t *rgba = (uint8_t *)malloc(binLen);
+            if (rgba &&
+                CryptStringToBinaryA(p, 0, CRYPT_STRING_BASE64, rgba, &binLen, NULL, NULL)) {
+                EnterCriticalSection(&inst->metaMu);
+                free(inst->favBuf);
+                inst->favBuf = rgba;
+                inst->favW = (int)w;
+                inst->favH = (int)h;
+                LeaveCriticalSection(&inst->metaMu);
+                free(msg);
+                goFaviconChanged(inst->goHandle);
+                return;
+            }
+            free(rgba);
+        }
+    }
+
+    free(msg);
+}
+
+static HRESULT STDMETHODCALLTYPE WebMsg_Invoke(
+        Handler *this, void *sender, void *args) {
+    (void)sender;
+    if (!args) return S_OK;
+
+    wchar_t *wmsg = NULL;
+    HRESULT hr = ((HRESULT (STDMETHODCALLTYPE *)(void *, wchar_t **))(
+        VTBL(args)[WVMSG_TRY_GET_STRING]))(args, &wmsg);
+    if (SUCCEEDED(hr) && wmsg) {
+        handle_meta_message(this->inst, wmsg);
+        CoTaskMemFree(wmsg);
+    }
+    return S_OK;
+}
+
+static void *webMsgVtbl[] = {
+    Handler_QueryInterface, Handler_AddRef, Handler_Release, WebMsg_Invoke
+};
+
+/* ── AddScriptToExecuteOnDocumentCreated completion handler (no-op) ───── */
+
+static HRESULT STDMETHODCALLTYPE AddScript_Invoke(
+        Handler *this, HRESULT errorCode, LPCWSTR id) {
+    (void)this; (void)errorCode; (void)id;
+    return S_OK;
+}
+
+static void *addScriptVtbl[] = {
+    Handler_QueryInterface, Handler_AddRef, Handler_Release, AddScript_Invoke
+};
+
 /* ── ControllerCompleted handler ─────────────────────────────────────── */
 
 static HRESULT STDMETHODCALLTYPE CtlCompleted_Invoke(
@@ -304,6 +453,20 @@ static HRESULT STDMETHODCALLTYPE CtlCompleted_Invoke(
     ((HRESULT (STDMETHODCALLTYPE *)(void *, void *, long long *))(
         VTBL(inst->webView)[WV_ADD_NAV_COMPLETED]))(
             inst->webView, &inst->navCompHandler, &token);
+
+    /* Receive title/favicon messages posted by the injected script, and inject
+       that script at document creation for every page. */
+    ((HRESULT (STDMETHODCALLTYPE *)(void *, void *, long long *))(
+        VTBL(inst->webView)[WV_ADD_WEB_MESSAGE]))(
+            inst->webView, &inst->webMsgHandler, &token);
+
+    wchar_t *wscript = utf8_to_wide(FYNE_META_SCRIPT);
+    if (wscript) {
+        ((HRESULT (STDMETHODCALLTYPE *)(void *, LPCWSTR, void *))(
+            VTBL(inst->webView)[WV_ADD_SCRIPT_ON_DOC]))(
+                inst->webView, wscript, &inst->addScriptHandler);
+        free(wscript);
+    }
 
     inst->ready = 1;
     return S_OK;
@@ -462,12 +625,14 @@ static HMODULE find_webview2_module(void) {
 
 /* ── Public API ──────────────────────────────────────────────────────── */
 
-WebViewInstance *WebView_Create(void *hwnd) {
+WebViewInstance *WebView_Create(uintptr_t hwnd, uintptr_t goHandle) {
     if (!hwnd) return NULL;
 
     WebViewInstance *inst = calloc(1, sizeof *inst);
     if (!inst) return NULL;
-    inst->parentHwnd = (HWND)hwnd;
+    inst->parentHwnd = (HWND)(uintptr_t)hwnd;
+    inst->goHandle   = goHandle;
+    InitializeCriticalSection(&inst->metaMu);
 
     /* Wire up the per-instance COM handlers (shared vtables, instance
        back-pointer). */
@@ -479,6 +644,10 @@ WebViewInstance *WebView_Create(void *hwnd) {
         (Handler){ navStartVtbl,     1, &IID_NavStartHandler, inst };
     inst->navCompHandler =
         (Handler){ navCompVtbl,      1, &IID_NavCompHandler,  inst };
+    inst->webMsgHandler =
+        (Handler){ webMsgVtbl,       1, &IID_WebMsgHandler,   inst };
+    inst->addScriptHandler =
+        (Handler){ addScriptVtbl,    1, &IID_IUnknown_local,  inst };
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
@@ -487,7 +656,7 @@ WebViewInstance *WebView_Create(void *hwnd) {
         fprintf(stderr,
                 "WebView2: could not find WebView2Loader.dll or "
                 "EmbeddedBrowserWebView.dll\n");
-        free(inst);
+        WebView_Destroy(inst);
         return NULL;
     }
 
@@ -509,7 +678,7 @@ WebViewInstance *WebView_Create(void *hwnd) {
             fprintf(stderr,
                     "WebView2: no usable creation function found\n");
             FreeLibrary(loader);
-            free(inst);
+            WebView_Destroy(inst);
             return NULL;
         }
         hr = createInternal(FALSE, 0, NULL, NULL, &inst->envCompletedHandler);
@@ -518,7 +687,7 @@ WebViewInstance *WebView_Create(void *hwnd) {
         fprintf(stderr,
                 "WebView2: CreateCoreWebView2EnvironmentWithOptions "
                 "failed (0x%08lx)\n", hr);
-        free(inst);
+        WebView_Destroy(inst);
         return NULL;
     }
 
@@ -583,6 +752,10 @@ void WebView_Destroy(WebViewInstance *inst) {
         subclass_detach(inst->parentHwnd);
         inst->subclassed = 0;
     }
+
+    free(inst->title);
+    free(inst->favBuf);
+    DeleteCriticalSection(&inst->metaMu);
 
     free(inst);
 }
@@ -665,6 +838,31 @@ int WebView_IsLoading(WebViewInstance *inst) {
 
 const char *WebView_GetURL(WebViewInstance *inst) {
     return inst ? inst->urlBuf : "";
+}
+
+char *WebView_CopyTitle(WebViewInstance *inst) {
+    if (!inst) return NULL;
+    EnterCriticalSection(&inst->metaMu);
+    char *t = inst->title ? strdup(inst->title) : NULL;
+    LeaveCriticalSection(&inst->metaMu);
+    return t;
+}
+
+const uint8_t *WebView_LockFavicon(WebViewInstance *inst, int *out_w, int *out_h) {
+    if (!inst) return NULL;
+    EnterCriticalSection(&inst->metaMu);
+    if (!inst->favBuf) {
+        LeaveCriticalSection(&inst->metaMu);
+        return NULL;
+    }
+    *out_w = inst->favW;
+    *out_h = inst->favH;
+    return inst->favBuf;   /* caller holds metaMu until WebView_UnlockFavicon */
+}
+
+void WebView_UnlockFavicon(WebViewInstance *inst) {
+    if (!inst) return;
+    LeaveCriticalSection(&inst->metaMu);
 }
 
 void WebView_Focus(WebViewInstance *inst) {
