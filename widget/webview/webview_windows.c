@@ -29,6 +29,7 @@
 #define ENV_CREATE_CONTROLLER 3
 
 /* ICoreWebView2Controller (IUnknown + 23 methods) */
+#define CTL_PUT_IS_VISIBLE    4
 #define CTL_PUT_BOUNDS        6
 #define CTL_MOVE_FOCUS        12
 #define CTL_CLOSE             24
@@ -597,6 +598,16 @@ void WebView_SetFrame(WebViewInstance *inst, double x, double y, double width, d
 
     ((HRESULT (STDMETHODCALLTYPE *)(void *, RECT))(
         VTBL(inst->controller)[CTL_PUT_BOUNDS]))(inst->controller, bounds);
+}
+
+void WebView_SetVisible(WebViewInstance *inst, int visible) {
+    if (!inst || !inst->controller) return;
+
+    /* Only one tab is shown at a time, so hiding the deselected controllers
+       removes the overlap — no child-HWND z-order juggling required. */
+    ((HRESULT (STDMETHODCALLTYPE *)(void *, BOOL))(
+        VTBL(inst->controller)[CTL_PUT_IS_VISIBLE]))(
+            inst->controller, visible ? TRUE : FALSE);
 }
 
 void WebView_SetDarkMode(WebViewInstance *inst, int dark) {
