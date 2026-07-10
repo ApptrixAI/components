@@ -1,46 +1,57 @@
-//go:build linux && !android && !wpe_fdo
+//go:build linux && !android && wpe_fdo
 
 /*
- * webview_linux.c — WPE WebKit 2.50+ headless rendering into a pixel buffer.
+ * webview_linux_fdo.c — legacy WPEBackend-FDO rendering into a pixel buffer.
  *
- * Architecture:
+ * This is the fallback backend, selected with `-tags wpe_fdo`, for systems
+ * whose wpewebkit is built WITHOUT the modern WPE Platform API / headless
+ * platform (notably Debian).  It implements the same webview_linux.h C API as
+ * the default headless backend (webview_linux.c) but is built on the older
+ * libwpe + WPEBackend-FDO stack:
+ *
  *   • A single shared GLib main loop (WebView_RunLoop) runs on a dedicated
- *     Go goroutine and performs one-time global init: a WPEDisplayHeadless,
- *     a GBM device for de-tiling DMA-BUF frames, and the process-wide
- *     memory-pressure / cache settings.
- *   • Each widget is a WebViewInstance: its own WebKitWebView, WPEView,
- *     toplevel and frame buffer.  Many instances coexist in one process,
- *     all driven by the shared loop and display.
- *   • WPE delivers each rendered frame via the render_buffer vtable slot.
- *     The slot lives on the (shared) WPEViewHeadless class, so it is patched
- *     once; the handler recovers the owning instance from the WPEView's
- *     object data.  SHM buffers are read directly; DMA-BUF buffers are
- *     de-tiled via GBM with a workaround for Mesa's gbm_bo_map staging-fd leak.
- *   • goFrameReady(goHandle) (exported from Go) is called after each frame
- *     copy so the Go side can refresh the right canvas.Image widget.
+ *     Go goroutine and performs one-time global init: wpe_fdo_initialize_shm()
+ *     and the process-wide memory-pressure / cache settings.
+ *   • Each widget is a WebViewInstance owning its own WebKitWebView plus an
+ *     "exportable" FDO view backend.  WebKit renders offscreen and exports each
+ *     frame as a wl_shm buffer through export_shm_buffer; we copy the pixels out
+ *     (BGRA→RGBA), then release the buffer and signal frame-complete so WebKit
+ *     renders the next frame.
+ *   • goFrameReady(goHandle) (exported from Go) is called after each frame copy
+ *     so the Go side can refresh the right canvas.Image widget.
+ *
+ * The SHM (rather than EGL) exportable is used deliberately: it hands us CPU
+ * pixels directly, so no EGL/GL context is required to read frames back.
+ *
+ * Feature parity note: the legacy stack has no shared WPEDisplay/WPESettings to
+ * carry WebKit's real prefers-color-scheme, so WebView_SetDarkMode is emulated
+ * by injecting a color-scheme USER stylesheet plus a matchMedia override (see
+ * COLORSCHEME_SCRIPT).  That covers UA-rendered pixels and JS feature
+ * detection; pages that switch purely via CSS `@media (prefers-color-scheme)`
+ * rules — a signal only the engine can set — may not fully follow.
  */
 
 #include "webview_linux.h"
 
-/* WPE Platform headless backend */
-#define __WPE_HEADLESS_H_INSIDE__
-#include <wpe/headless/WPEDisplayHeadless.h>
-#include <wpe/headless/WPEToplevelHeadless.h>
-#include <wpe/headless/WPEViewHeadless.h>
-#undef __WPE_HEADLESS_H_INSIDE__
-
-#include <wpe/wpe-platform.h>
+/* WPEBackend-FDO — legacy libwpe path */
 #include <wpe/webkit.h>
 #include <jsc/jsc.h>
 
+#define WPE_FDO_COMPILATION 0
+#include <wpe/fdo.h>
+#define __WPE_FDO_SHM_H_INSIDE__
+#include <wpe/unstable/fdo-shm.h>
+#undef __WPE_FDO_SHM_H_INSIDE__
+
+#include <wpe/wpe.h>              /* libwpe: view backend + input events */
+#include <wayland-server-core.h> /* wl_shm_buffer accessors */
+
 #include <glib.h>
-#include <gbm.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
 
 /* ── Go callback (exported from the Go package) ──────────────────────── */
 
@@ -48,38 +59,29 @@ extern void goFrameReady(uintptr_t goHandle);
 extern void goTitleChanged(uintptr_t goHandle);
 extern void goFaviconChanged(uintptr_t goHandle);
 
-/* ── Shared, process-wide state ────────────────────────────────────────── */
-
-static WPEDisplay        *_display = NULL;
-static int                _drmFd   = -1;
-static struct gbm_device *_gbm     = NULL;
-
-/* Original render_buffer vtable method — we chain to it after reading
-   pixels so that WPE's internal buffer lifecycle (recycling, fd
-   management) works correctly. */
-static gboolean (*_orig_render_buffer)(WPEView *, WPEBuffer *,
-                                       const WPERectangle *, guint,
-                                       GError **) = NULL;
-
-/* Key under which each WPEView stores a back-pointer to its instance. */
-#define WV_INSTANCE_KEY "wv_instance"
-
-/* Minimum interval between frame copies (microseconds).
-   Frames arriving faster than this are returned to WPE immediately
+/* ── Minimum interval between frame copies (microseconds). ───────────────
+   Frames arriving faster than this are released back to WPE immediately
    without the expensive pixel copy. */
 #define FRAME_MIN_INTERVAL_US (1000000 / 60)   /* ~60 fps */
 
 /* ── Per-instance state ──────────────────────────────────────────────── */
 
 struct WebViewInstance {
-    WebKitWebView *webView;
-    WPEView       *wpeView;
-    WPEToplevel   *toplevel;
+    WebKitWebView                          *webView;
+    struct wpe_view_backend_exportable_fdo *exportable;
+    struct wpe_view_backend                *backend;   /* owned by webView */
+
+    /* Kept for runtime dark-mode toggling: the color-scheme user stylesheet
+       is removed and re-added when the mode changes.  dark is the last mode
+       pushed, re-applied to each freshly committed document. */
+    WebKitUserContentManager *ucm;
+    int                       dark;
 
     uintptr_t      goHandle;   /* opaque token for goFrameReady */
 
     int            w;
     int            h;
+    double         scale;      /* last device scale factor pushed to WebKit */
 
     /* Frame pixel buffer (RGBA8888). */
     pthread_mutex_t frameMu;
@@ -148,134 +150,120 @@ static const char *FAVICON_SCRIPT =
 "    {childList:true,subtree:true,attributes:true,attributeFilter:['href','rel','sizes']});}catch(e){}"
 "})();";
 
-/* ── render_buffer vtable override ──────────────────────────────────────
-   Shared across all WPEViewHeadless instances; the owning WebViewInstance
-   is recovered from the view's object data. */
+/* Dark-mode support for the legacy backend, which cannot set WebKit's real
+   prefers-color-scheme.  The color-scheme itself is forced with an injected
+   USER stylesheet (see apply_dark_stylesheet), which covers UA-rendered pixels
+   — default backgrounds, form controls, scrollbars.  This companion script,
+   injected at document-start into every frame, additionally makes JS feature
+   detection agree: it overrides window.matchMedia so prefers-color-scheme
+   queries report the forced value and deliver change events to listeners.
+   The current value is pushed in via window.__wvApplyDark (from C) on each
+   document commit and whenever the mode toggles. */
+static const char *COLORSCHEME_SCRIPT =
+"(function(){"
+"  if(window.__wvApplyDark)return;"
+"  var dark=false, mqls=[];"
+"  function fire(){"
+"    for(var i=0;i<mqls.length;i++){var m=mqls[i],ev;"
+"      try{ev=new MediaQueryListEvent('change',{matches:m.matches,media:m.media});}"
+"      catch(e){ev={type:'change',media:m.media,matches:m.matches};}"
+"      var ls=(m.__wvL||[]).slice();"
+"      for(var j=0;j<ls.length;j++){try{ls[j].call(m,ev);}catch(e){}}"
+"      if(typeof m.onchange==='function'){try{m.onchange.call(m,ev);}catch(e){}}}"
+"  }"
+"  window.__wvApplyDark=function(d){dark=!!d;fire();};"
+"  var orig=window.matchMedia;"
+"  if(!orig)return;"
+"  window.matchMedia=function(q){"
+"    var mql=orig.call(this,q);"
+"    if(mql&&/prefers-color-scheme/i.test(String(q))){"
+"      var wantsDark=!/light/i.test(String(q));"
+"      try{Object.defineProperty(mql,'matches',{configurable:true,"
+"        get:function(){return wantsDark?dark:!dark;}});}catch(e){}"
+"      mql.__wvL=[];"
+"      var _a=mql.addEventListener&&mql.addEventListener.bind(mql);"
+"      var _r=mql.removeEventListener&&mql.removeEventListener.bind(mql);"
+"      mql.addEventListener=function(t,cb){if(t==='change'&&cb){mql.__wvL.push(cb);}else if(_a){_a.apply(null,arguments);}};"
+"      mql.removeEventListener=function(t,cb){if(t==='change'){var k=mql.__wvL.indexOf(cb);if(k>=0)mql.__wvL.splice(k,1);}else if(_r){_r.apply(null,arguments);}};"
+"      mql.addListener=function(cb){if(cb)mql.__wvL.push(cb);};"
+"      mql.removeListener=function(cb){var k=mql.__wvL.indexOf(cb);if(k>=0)mql.__wvL.splice(k,1);};"
+"      mqls.push(mql);"
+"    }"
+"    return mql;"
+"  };"
+"})();";
 
-static gboolean our_render_buffer(WPEView            *view,
-                                  WPEBuffer          *buffer,
-                                  const WPERectangle *rects,
-                                  guint               n_rects,
-                                  GError            **error)
+/* ── SHM frame export ────────────────────────────────────────────────────
+   Runs on the loop thread when WebKit has a new frame.  We copy the pixels
+   out (BGRA→RGBA), then always release the buffer and signal frame-complete
+   so WebKit can render the next frame — even when we skip the copy for
+   rate-limiting, the buffer must be returned or rendering stalls. */
+
+static void on_export_shm_buffer(void *data,
+                                 struct wpe_fdo_shm_exported_buffer *buffer)
 {
-    (void)rects; (void)n_rects; (void)error;
+    WebViewInstance *inst = (WebViewInstance *)data;
 
-    WebViewInstance *inst =
-        (WebViewInstance *)g_object_get_data(G_OBJECT(view), WV_INSTANCE_KEY);
-    if (!inst) {
-        /* No owner (being destroyed) — just recycle the buffer. */
-        if (_orig_render_buffer)
-            return _orig_render_buffer(view, buffer, rects, n_rects, error);
-        wpe_view_buffer_rendered(view, buffer);
-        return TRUE;
-    }
-
-    /* Rate-limit: skip the expensive pixel copy if we produced a frame
-       recently.  Always release the buffer immediately so WPE can
-       reuse it — holding buffers forces the web process to allocate
-       new ones, causing unbounded memory growth. */
     int64_t now = g_get_monotonic_time();
-    if (now - inst->lastFrameTimeUs < FRAME_MIN_INTERVAL_US) {
-        /* Skip pixel copy but still chain to original for buffer recycling. */
-        if (_orig_render_buffer)
-            return _orig_render_buffer(view, buffer, rects, n_rects, error);
-        wpe_view_buffer_rendered(view, buffer);
-        return TRUE;
-    }
+    int rate_limited = (now - inst->lastFrameTimeUs < FRAME_MIN_INTERVAL_US);
 
-    int           w      = wpe_buffer_get_width(buffer);
-    int           h      = wpe_buffer_get_height(buffer);
-    const uint8_t *pixels = NULL;
-    int           stride  = 0;
-    gsize         size    = 0;
+    struct wl_shm_buffer *shm =
+        buffer ? wpe_fdo_shm_exported_buffer_get_shm_buffer(buffer) : NULL;
 
-    /* Per-frame GBM map state (unmap after copy). */
-    struct gbm_bo *bo       = NULL;
-    void          *map_data = NULL;
+    if (shm && !rate_limited) {
+        wl_shm_buffer_begin_access(shm);
+        const uint8_t *pixels = (const uint8_t *)wl_shm_buffer_get_data(shm);
+        int w      = wl_shm_buffer_get_width(shm);
+        int h      = wl_shm_buffer_get_height(shm);
+        int stride = wl_shm_buffer_get_stride(shm);
 
-    if (WPE_IS_BUFFER_SHM(buffer)) {
-        WPEBufferSHM *shm = WPE_BUFFER_SHM(buffer);
-        GBytes *bytes  = wpe_buffer_shm_get_data(shm);
-        stride = (int)wpe_buffer_shm_get_stride(shm);
-        pixels = g_bytes_get_data(bytes, &size);
-    } else if (WPE_IS_BUFFER_DMA_BUF(buffer) && _gbm) {
-        WPEBufferDMABuf *dmabuf = WPE_BUFFER_DMA_BUF(buffer);
-        guint n_planes = wpe_buffer_dma_buf_get_n_planes(dmabuf);
-
-        struct gbm_import_fd_modifier_data imp = {
-            .width    = (uint32_t)w,
-            .height   = (uint32_t)h,
-            .format   = wpe_buffer_dma_buf_get_format(dmabuf),
-            .num_fds  = n_planes,
-            .modifier = wpe_buffer_dma_buf_get_modifier(dmabuf),
-        };
-        for (guint i = 0; i < n_planes && i < 4; i++) {
-            imp.fds[i]     = wpe_buffer_dma_buf_get_fd(dmabuf, i);
-            imp.strides[i] = (int)wpe_buffer_dma_buf_get_stride(dmabuf, i);
-            imp.offsets[i] = (int)wpe_buffer_dma_buf_get_offset(dmabuf, i);
-        }
-
-        bo = gbm_bo_import(_gbm, GBM_BO_IMPORT_FD_MODIFIER,
-                           &imp, GBM_BO_USE_LINEAR);
-        if (bo) {
-            uint32_t map_stride = 0;
-            void *mapped = gbm_bo_map(bo, 0, 0, (uint32_t)w, (uint32_t)h,
-                                      GBM_BO_TRANSFER_READ,
-                                      &map_stride, &map_data);
-            if (mapped) {
-                pixels = (const uint8_t *)mapped;
-                stride = (int)map_stride;
-                size   = (gsize)h * (gsize)stride;
+        if (pixels && w > 0 && h > 0 && stride > 0) {
+            int dst_stride = w * 4;
+            pthread_mutex_lock(&inst->frameMu);
+            if (!inst->frameBuf || inst->frameW != w || inst->frameH != h) {
+                free(inst->frameBuf);
+                inst->frameBuf = malloc((gsize)h * (gsize)dst_stride);
             }
-        }
-    }
-
-    if (pixels && w > 0 && h > 0 && stride > 0 &&
-        size >= (gsize)h * (gsize)stride)
-    {
-        int dst_stride = w * 4;
-        pthread_mutex_lock(&inst->frameMu);
-        if (!inst->frameBuf || inst->frameW != w || inst->frameH != h) {
-            free(inst->frameBuf);
-            inst->frameBuf = malloc((gsize)h * (gsize)dst_stride);
-        }
-        if (inst->frameBuf) {
-            /* BGRA → RGBA swizzle during copy so Go can memcpy directly. */
-            for (int y = 0; y < h; y++) {
-                const uint8_t *src_row = pixels + y * stride;
-                uint8_t       *dst_row = inst->frameBuf + y * dst_stride;
-                for (int x = 0; x < w; x++) {
-                    dst_row[x*4+0] = src_row[x*4+2]; /* R */
-                    dst_row[x*4+1] = src_row[x*4+1]; /* G */
-                    dst_row[x*4+2] = src_row[x*4+0]; /* B */
-                    dst_row[x*4+3] = 255;             /* A — force opaque */
+            if (inst->frameBuf) {
+                /* BGRA → RGBA swizzle during copy so Go can memcpy directly. */
+                for (int y = 0; y < h; y++) {
+                    const uint8_t *src_row = pixels + (gsize)y * stride;
+                    uint8_t       *dst_row = inst->frameBuf + (gsize)y * dst_stride;
+                    for (int x = 0; x < w; x++) {
+                        dst_row[x*4+0] = src_row[x*4+2]; /* R */
+                        dst_row[x*4+1] = src_row[x*4+1]; /* G */
+                        dst_row[x*4+2] = src_row[x*4+0]; /* B */
+                        dst_row[x*4+3] = 255;             /* A — force opaque */
+                    }
                 }
+                inst->frameW      = w;
+                inst->frameH      = h;
+                inst->frameStride = dst_stride;
+                inst->frameReady  = 1;
+                inst->lastFrameTimeUs = now;
             }
-            inst->frameW      = w;
-            inst->frameH      = h;
-            inst->frameStride = dst_stride;
-            inst->frameReady  = 1;
-            inst->lastFrameTimeUs = now;
+            pthread_mutex_unlock(&inst->frameMu);
         }
-        pthread_mutex_unlock(&inst->frameMu);
+        wl_shm_buffer_end_access(shm);
+
+        goFrameReady(inst->goHandle);
     }
 
-    if (bo) {
-        if (map_data)
-            gbm_bo_unmap(bo, map_data);
-        gbm_bo_destroy(bo);
-    }
-
-    goFrameReady(inst->goHandle);
-
-    /* Chain to the original WPEViewHeadless render_buffer so that WPE's
-       internal buffer pool management (recycling, fd cleanup) works.
-       Without this, WPE allocates a new DMA-BUF every frame. */
-    if (_orig_render_buffer)
-        return _orig_render_buffer(view, buffer, rects, n_rects, error);
-    wpe_view_buffer_rendered(view, buffer);
-    return TRUE;
+    /* Always return the buffer and signal frame-complete so rendering
+       continues, whether or not we copied this frame. */
+    if (buffer)
+        wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
+            inst->exportable, buffer);
+    wpe_view_backend_exportable_fdo_dispatch_frame_complete(inst->exportable);
 }
+
+static const struct wpe_view_backend_exportable_fdo_client s_exportable_client = {
+    .export_buffer_resource = NULL,   /* unused: SHM init only exports SHM */
+    .export_dmabuf_resource = NULL,
+    .export_shm_buffer      = on_export_shm_buffer,
+    ._wpe_reserved0         = NULL,
+    ._wpe_reserved1         = NULL,
+};
 
 /* ── g_idle_add helpers ──────────────────────────────────────────────────
    Each runs on the loop thread.  The data pointer carries the target
@@ -326,10 +314,9 @@ typedef struct { WebViewInstance *inst; int w, h; } SizeArgs;
 static gboolean idle_set_size(gpointer data)
 {
     SizeArgs *a = (SizeArgs *)data;
-    if (a->inst->wpeView)
-        wpe_view_resized(a->inst->wpeView, a->w, a->h);
-    if (a->inst->toplevel)
-        wpe_toplevel_resize(a->inst->toplevel, a->w, a->h);
+    if (a->inst->backend)
+        wpe_view_backend_dispatch_set_size(a->inst->backend,
+                                           (uint32_t)a->w, (uint32_t)a->h);
     free(a);
     return G_SOURCE_REMOVE;
 }
@@ -347,7 +334,7 @@ static void on_web_process_terminated(WebKitWebView *wv,
     case WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT:  msg = "exceeded memory limit";  break;
     case WEBKIT_WEB_PROCESS_TERMINATED_BY_API:      msg = "terminated by API";      break;
     }
-    fprintf(stderr, "webview_linux: web process %s — reloading\n", msg);
+    fprintf(stderr, "webview_linux(fdo): web process %s — reloading\n", msg);
     webkit_web_view_reload(wv);
 }
 
@@ -409,39 +396,74 @@ static void on_favicon_message(WebKitUserContentManager *m, JSCValue *value,
     g_free(str);
 }
 
+/* ── Dark mode (runs on the loop thread) ─────────────────────────────────
+   The legacy stack has no shared WPEDisplay/WPESettings to carry the real
+   prefers-color-scheme, so we force the color-scheme with a USER stylesheet
+   (visible pixels: default backgrounds, form controls, scrollbars) and push
+   the same value into the matchMedia override (JS feature detection). */
+
+static void apply_dark_stylesheet(WebViewInstance *inst)
+{
+    if (!inst->ucm)
+        return;
+    /* Only the color-scheme sheet is ever added here, so clearing all user
+       style sheets before re-adding is safe (scripts are a separate list). */
+    webkit_user_content_manager_remove_all_style_sheets(inst->ucm);
+    const char *css = inst->dark
+        ? ":root{color-scheme:dark!important}"
+        : ":root{color-scheme:light!important}";
+    WebKitUserStyleSheet *ss = webkit_user_style_sheet_new(
+        css, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_STYLE_LEVEL_USER, NULL, NULL);
+    webkit_user_content_manager_add_style_sheet(inst->ucm, ss);
+    webkit_user_style_sheet_unref(ss);
+}
+
+/* Push the current mode into the page's matchMedia override.  A newly loaded
+   document re-runs COLORSCHEME_SCRIPT (which defaults to light), so this must
+   be re-applied on every commit as well as on toggle. */
+static void apply_dark_js(WebViewInstance *inst)
+{
+    if (!inst->webView)
+        return;
+    char *js = g_strdup_printf(
+        "window.__wvApplyDark&&window.__wvApplyDark(%s)",
+        inst->dark ? "true" : "false");
+    webkit_web_view_evaluate_javascript(inst->webView, js, -1,
+                                        NULL, NULL, NULL, NULL, NULL);
+    g_free(js);
+}
+
+/* Re-push the JS dark state once each new document has committed; the
+   stylesheet persists across loads on its own. */
+static void on_load_changed(WebKitWebView *wv, WebKitLoadEvent event, gpointer data)
+{
+    (void)wv;
+    if (event == WEBKIT_LOAD_COMMITTED)
+        apply_dark_js((WebViewInstance *)data);
+}
+
 /* ── One-time global initialisation (runs on the loop thread) ─────────── */
 
 static int global_init(void)
 {
-    GError *error = NULL;
-
-    /* Open a DRI render node for GBM so we can de-tile DMA-BUF frames. */
-    const char *render_nodes[] = {
-        "/dev/dri/renderD128", "/dev/dri/renderD129", NULL
-    };
-    for (int i = 0; render_nodes[i] && _drmFd < 0; i++)
-        _drmFd = open(render_nodes[i], O_RDWR);
-    if (_drmFd >= 0)
-        _gbm = gbm_create_device(_drmFd);
-    if (!_gbm)
-        fprintf(stderr, "webview_linux: no GBM device (DMA-BUF frames will be unavailable)\n");
-
-    /* Create and connect the headless display, shared by every instance. */
-    _display = wpe_display_headless_new();
-    if (!_display) {
-        fprintf(stderr, "webview_linux: wpe_display_headless_new() failed\n");
-        return 0;
+    /* libwpe dlopens its backend implementation at runtime.  Its default is
+       libWPEBackend-default.so, which most distributions don't ship — the FDO
+       backend installs as libWPEBackend-fdo-1.0.so.1 (its SONAME, present even
+       without -dev packages).  Point the loader at it explicitly, unless the
+       caller has already chosen a backend via WPE_BACKEND_LIBRARY. */
+    if (!g_getenv("WPE_BACKEND_LIBRARY")) {
+        if (!wpe_loader_init("libWPEBackend-fdo-1.0.so.1"))
+            fprintf(stderr, "webview_linux(fdo): wpe_loader_init() failed — "
+                            "is libWPEBackend-fdo installed?\n");
     }
 
-    if (!wpe_display_connect(_display, &error)) {
-        fprintf(stderr, "webview_linux: wpe_display_connect() failed: %s\n",
-                error ? error->message : "(unknown)");
-        if (error) g_error_free(error);
+    /* Bring up the FDO SHM backend.  Unlike the EGL exportable this needs no
+       EGL display, so frames come back as CPU-mappable wl_shm buffers. */
+    if (!wpe_fdo_initialize_shm()) {
+        fprintf(stderr, "webview_linux(fdo): wpe_fdo_initialize_shm() failed\n");
         return 0;
     }
-
-    /* Make this the primary display so webkit_web_view_new(NULL) picks it up. */
-    wpe_display_set_primary(_display);
 
     /* ── Memory pressure — MUST be set before any WebKitNetworkSession
        or WebKitWebContext is touched, otherwise the defaults are already
@@ -483,9 +505,9 @@ void WebView_RunLoop(void)
     if (!ok)
         return;
 
-    /* Run the real GLib main loop so that all GLib/WebKit timers,
-       idle handlers, and — critically — the memory-pressure poller
-       fire on schedule. */
+    /* Run the real GLib main loop so that all GLib/WebKit timers, idle
+       handlers, the FDO wl_display source, and — critically — the
+       memory-pressure poller fire on schedule. */
     GMainLoop *loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(loop);          /* blocks forever */
     g_main_loop_unref(loop);
@@ -515,6 +537,7 @@ static WebViewInstance *instance_create(int width, int height, uintptr_t goHandl
     pthread_mutex_init(&inst->metaMu, NULL);
     inst->w        = width;
     inst->h        = height;
+    inst->scale    = 1.0;
     inst->goHandle = goHandle;
 
     /* User content manager: carries the favicon-reading script and receives
@@ -531,6 +554,19 @@ static WebViewInstance *instance_create(int width, int height, uintptr_t goHandl
     webkit_user_content_manager_add_script(ucm, script);
     webkit_user_script_unref(script);
 
+    /* Dark-mode matchMedia override — installed early, in every frame. */
+    WebKitUserScript *csScript = webkit_user_script_new(
+        COLORSCHEME_SCRIPT,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+        NULL, NULL);
+    webkit_user_content_manager_add_script(ucm, csScript);
+    webkit_user_script_unref(csScript);
+
+    /* Keep our own ref so dark mode can toggle the color-scheme stylesheet at
+       runtime; released in idle_destroy. */
+    inst->ucm = g_object_ref(ucm);
+
     WebKitSettings *settings = webkit_settings_new();
     webkit_settings_set_enable_page_cache(settings, FALSE);
     webkit_settings_set_enable_html5_local_storage(settings, FALSE);
@@ -543,19 +579,38 @@ static WebViewInstance *instance_create(int width, int height, uintptr_t goHandl
     webkit_settings_set_enable_media_capabilities(settings, FALSE);
     webkit_settings_set_enable_media_stream(settings, FALSE);
 
-    /* Create the WebKitWebView bound to our shared headless display. Passing
-       "display" explicitly is essential to avoid new displays created at runtime
-       which would lose WPE_SETTING_DARK_MODE etc) */
+    /* Create the exportable FDO view backend that renders offscreen and hands
+       us wl_shm frames.  The WebKitWebViewBackend wrapper takes ownership: when
+       the web view is destroyed it invokes the destroy-notify below, which
+       tears the exportable down — so we never destroy it ourselves. */
+    inst->exportable = wpe_view_backend_exportable_fdo_create(
+        &s_exportable_client, inst, (uint32_t)width, (uint32_t)height);
+    if (!inst->exportable) {
+        fprintf(stderr, "webview_linux(fdo): exportable_fdo_create() failed\n");
+        g_object_unref(settings);
+        g_object_unref(ucm);
+        free(inst);
+        return NULL;
+    }
+    inst->backend = wpe_view_backend_exportable_fdo_get_view_backend(inst->exportable);
+
+    WebKitWebViewBackend *vb = webkit_web_view_backend_new(
+        inst->backend,
+        (GDestroyNotify)wpe_view_backend_exportable_fdo_destroy,
+        inst->exportable);
+
     inst->webView = g_object_ref_sink(
         WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
-                                     "display", _display,
+                                     "backend", vb,
                                      "settings", settings,
                                      "user-content-manager", ucm,
                                      NULL)));
     g_object_unref(settings);
     g_object_unref(ucm);   /* the web view now holds the only ref */
     if (!inst->webView) {
-        fprintf(stderr, "webview_linux: webkit_web_view_new() failed\n");
+        fprintf(stderr, "webview_linux(fdo): webkit_web_view_new() failed\n");
+        /* vb (and thus the exportable) is freed by WebKit's failed construction
+           taking the floating backend; nothing else to release here. */
         free(inst);
         return NULL;
     }
@@ -569,50 +624,18 @@ static WebViewInstance *instance_create(int width, int height, uintptr_t goHandl
     g_signal_connect(inst->webView, "notify::title",
         G_CALLBACK(on_notify_title), inst);
 
-    /* Retrieve the underlying WPEView. */
-    inst->wpeView = webkit_web_view_get_wpe_view(inst->webView);
-    if (!inst->wpeView) {
-        fprintf(stderr, "webview_linux: webkit_web_view_get_wpe_view() returned NULL\n");
-        g_object_unref(inst->webView);
-        free(inst);
-        return NULL;
-    }
+    /* Re-push dark state to each newly committed document. */
+    g_signal_connect(inst->webView, "load-changed",
+        G_CALLBACK(on_load_changed), inst);
 
-    /* Let our_render_buffer find this instance from the view. */
-    g_object_set_data(G_OBJECT(inst->wpeView), WV_INSTANCE_KEY, inst);
-
-    /* Use the view's actual display for the toplevel so the pointer-equality
-       assertion in wpe_view_set_toplevel is satisfied. Now that we construct
-       the view with "display", this is _display, but query it to stay robust. */
-    WPEDisplay *viewDisplay = webkit_web_view_get_display(inst->webView);
-    if (!viewDisplay) {
-        fprintf(stderr, "webview_linux: webkit_web_view_get_display() returned NULL\n");
-        g_object_unref(inst->webView);
-        free(inst);
-        return NULL;
-    }
-
-    inst->toplevel = wpe_display_create_toplevel(viewDisplay, 1);
-    if (!inst->toplevel) {
-        fprintf(stderr, "webview_linux: wpe_display_create_toplevel() returned NULL\n");
-        g_object_unref(inst->webView);
-        free(inst);
-        return NULL;
-    }
-    wpe_toplevel_resize(inst->toplevel, width, height);
-    wpe_view_set_toplevel(inst->wpeView, inst->toplevel);
-    wpe_view_resized(inst->wpeView, width, height);
-
-    /* Patch the WPEViewHeadless class vtable to capture rendered frames.
-       The vtable is shared by every instance, so do it only once and save
-       the original so we can chain to it for proper buffer lifecycle. */
-    if (!_orig_render_buffer) {
-        _orig_render_buffer = WPE_VIEW_GET_CLASS(inst->wpeView)->render_buffer;
-        WPE_VIEW_GET_CLASS(inst->wpeView)->render_buffer = our_render_buffer;
-    }
-
-    /* Map the view so WPE starts rendering. */
-    wpe_view_map(inst->wpeView);
+    /* Mark the offscreen view visible, focused and in-window.  The headless
+       backend gets this implicitly from wpe_view_map(); the legacy backend
+       does not, and without it WebKit ignores pointer/keyboard input (no
+       focus) and throttles rendering as if the page were hidden. */
+    wpe_view_backend_add_activity_state(inst->backend,
+        wpe_view_activity_state_visible |
+        wpe_view_activity_state_focused |
+        wpe_view_activity_state_in_window);
 
     return inst;
 }
@@ -680,17 +703,19 @@ static gboolean idle_destroy(gpointer data)
     DestroyArgs *a = (DestroyArgs *)data;
     WebViewInstance *inst = a->inst;
 
-    if (inst->wpeView) {
-        /* Stop frames routing to this instance before we free it. */
-        g_object_set_data(G_OBJECT(inst->wpeView), WV_INSTANCE_KEY, NULL);
-        wpe_view_unmap(inst->wpeView);
-    }
     if (inst->webView) {
         g_signal_handlers_disconnect_by_data(inst->webView, NULL);
-        g_object_unref(inst->webView);   /* also disposes its WPEView */
+        /* Disposing the view frees its WebKitWebViewBackend, whose destroy
+           notify tears down the exportable (and its wpe_view_backend).  After
+           this no further export_shm_buffer callback can fire for this inst. */
+        g_object_unref(inst->webView);
     }
-    if (inst->toplevel)
-        g_object_unref(inst->toplevel);
+    if (inst->ucm) {
+        g_object_unref(inst->ucm);
+        inst->ucm = NULL;
+    }
+    inst->exportable = NULL;
+    inst->backend    = NULL;
 
     pthread_mutex_lock(&inst->frameMu);
     free(inst->frameBuf);
@@ -766,8 +791,11 @@ typedef struct { WebViewInstance *inst; double scale; } ScaleArgs;
 static gboolean idle_set_scale(gpointer data)
 {
     ScaleArgs *a = (ScaleArgs *)data;
-    if (a->inst->toplevel)
-        wpe_toplevel_scale_changed(a->inst->toplevel, a->scale);
+    if (a->scale > 0)
+        a->inst->scale = a->scale;   /* used to convert pointer coords below */
+    if (a->inst->backend)
+        wpe_view_backend_dispatch_set_device_scale_factor(a->inst->backend,
+                                                          (float)a->scale);
     free(a);
     return G_SOURCE_REMOVE;
 }
@@ -786,24 +814,28 @@ void WebView_SetScale(WebViewInstance *inst, double scale)
 
 /* ── Appearance ──────────────────────────────────────────────────────── */
 
-static gboolean idle_set_dark_mode(gpointer data)
+typedef struct { WebViewInstance *inst; int dark; } DarkArgs;
+
+static gboolean idle_set_dark(gpointer data)
 {
-    gboolean dark = GPOINTER_TO_INT(data);
-    WPEDisplay *d = _display;
-    if (!d) d = wpe_display_get_primary();
-    if (d) {
-        WPESettings *settings = wpe_display_get_settings(d);
-        if (settings)
-            wpe_settings_set_boolean(settings, WPE_SETTING_DARK_MODE, dark,
-                                     WPE_SETTINGS_SOURCE_APPLICATION, NULL);
-    }
+    DarkArgs *a = (DarkArgs *)data;
+    a->inst->dark = a->dark ? 1 : 0;
+    apply_dark_stylesheet(a->inst);
+    apply_dark_js(a->inst);
+    free(a);
     return G_SOURCE_REMOVE;
 }
 
 void WebView_SetDarkMode(WebViewInstance *inst, int dark)
 {
-    (void)inst;   /* dark mode is a property of the shared display */
-    g_idle_add(idle_set_dark_mode, GINT_TO_POINTER(dark));
+    if (!inst)
+        return;
+    DarkArgs *a = malloc(sizeof *a);
+    if (a) {
+        a->inst = inst;
+        a->dark = dark;
+        g_idle_add(idle_set_dark, a);
+    }
 }
 
 /* ── Navigation ──────────────────────────────────────────────────────── */
@@ -827,23 +859,46 @@ void WebView_Stop(WebViewInstance *inst)      { if (inst) g_idle_add(idle_stop, 
 
 /* ── Input events ────────────────────────────────────────────────────── */
 
-typedef struct { WebViewInstance *inst; double x, y; int button; int down; } MouseBtnArgs;
+static uint32_t _ms_now(void) { return (uint32_t)(g_get_monotonic_time() / 1000); }
 
-static guint32 _ms_now(void) { return (guint32)(g_get_monotonic_time() / 1000); }
+/* Legacy libwpe pointer coordinates are in physical device pixels — WebKit's
+   event factory divides them by the device scale factor — whereas Fyne reports
+   logical coordinates.  Convert using the last scale pushed to the backend, or
+   hover/click land at the wrong place on HiDPI displays. */
+static inline int phys_coord(WebViewInstance *inst, double v)
+{
+    double s = inst->scale > 0 ? inst->scale : 1.0;
+    return (int)(v * s + 0.5);
+}
+
+/* The legacy libwpe button convention (1=left, 2=right, 3=middle) swaps middle
+   and right relative to the modern WPE Platform API the Go side maps to
+   (1=left, 2=middle, 3=right). */
+static inline uint32_t legacy_button(int b)
+{
+    switch (b) {
+    case 2:  return 3;   /* Go middle → legacy middle */
+    case 3:  return 2;   /* Go right  → legacy right  */
+    default: return 1;   /* left */
+    }
+}
+
+typedef struct { WebViewInstance *inst; double x, y; int button; int down; } MouseBtnArgs;
 
 static gboolean idle_mouse_btn(gpointer data)
 {
     MouseBtnArgs *a = data;
-    WPEView *view = a->inst->wpeView;
-    if (view) {
-        WPEEvent *ev = wpe_event_pointer_button_new(
-            a->down ? WPE_EVENT_POINTER_DOWN : WPE_EVENT_POINTER_UP,
-            view, WPE_INPUT_SOURCE_MOUSE, _ms_now(),
-            0, a->button, a->x, a->y,
-            a->down ? wpe_view_compute_press_count(view,
-                          a->x, a->y, a->button, _ms_now()) : 0);
-        wpe_view_event(view, ev);
-        wpe_event_unref(ev);
+    if (a->inst->backend) {
+        struct wpe_input_pointer_event ev = {
+            .type      = wpe_input_pointer_event_type_button,
+            .time      = _ms_now(),
+            .x         = phys_coord(a->inst, a->x),
+            .y         = phys_coord(a->inst, a->y),
+            .button    = legacy_button(a->button),
+            .state     = a->down ? 1u : 0u,
+            .modifiers = 0,
+        };
+        wpe_view_backend_dispatch_pointer_event(a->inst->backend, &ev);
     }
     free(a);
     return G_SOURCE_REMOVE;
@@ -858,13 +913,17 @@ static gboolean idle_mouse_move(gpointer data)
     inst->movePending = 0;
     pthread_mutex_unlock(&inst->moveMu);
 
-    if (inst->wpeView) {
-        WPEEvent *ev = wpe_event_pointer_move_new(
-            WPE_EVENT_POINTER_MOVE, inst->wpeView,
-            WPE_INPUT_SOURCE_MOUSE, _ms_now(),
-            0, x, y, 0, 0);
-        wpe_view_event(inst->wpeView, ev);
-        wpe_event_unref(ev);
+    if (inst->backend) {
+        struct wpe_input_pointer_event ev = {
+            .type      = wpe_input_pointer_event_type_motion,
+            .time      = _ms_now(),
+            .x         = phys_coord(inst, x),
+            .y         = phys_coord(inst, y),
+            .button    = 0,
+            .state     = 0,
+            .modifiers = 0,
+        };
+        wpe_view_backend_dispatch_pointer_event(inst->backend, &ev);
     }
     return G_SOURCE_REMOVE;
 }
@@ -882,12 +941,31 @@ static gboolean idle_scroll(gpointer data)
     inst->scrollPending = 0;
     pthread_mutex_unlock(&inst->scrollMu);
 
-    if (inst->wpeView) {
-        WPEEvent *ev = wpe_event_scroll_new(
-            inst->wpeView, WPE_INPUT_SOURCE_MOUSE, _ms_now(),
-            0, dx, dy, FALSE, FALSE, x, y);
-        wpe_view_event(inst->wpeView, ev);
-        wpe_event_unref(ev);
+    if (inst->backend) {
+        /* The legacy smooth 2D axis carries pixel deltas that WebKit scrolls
+           by directly (dividing by ~40px per line for tick counts), and it
+           negates them, whereas the Go side pre-scales deltas by 1/20 for the
+           modern API's step-based scroll.  Undo that and convert to a usable
+           pixel delta; negate to match WebKit's legacy axis sign convention.
+           SCROLL_GAIN is a feel constant — raise it for faster scrolling,
+           flip its sign if the direction comes out inverted. */
+        const double SCROLL_GAIN = -60.0;
+        struct wpe_input_axis_2d_event ev = {
+            .base = {
+                .type      = (enum wpe_input_axis_event_type)
+                             (wpe_input_axis_event_type_motion_smooth |
+                              wpe_input_axis_event_type_mask_2d),
+                .time      = _ms_now(),
+                .x         = phys_coord(inst, x),
+                .y         = phys_coord(inst, y),
+                .axis      = 0,
+                .value     = 0,
+                .modifiers = 0,
+            },
+            .x_axis = dx * SCROLL_GAIN,
+            .y_axis = dy * SCROLL_GAIN,
+        };
+        wpe_view_backend_dispatch_axis_event(inst->backend, &ev.base);
     }
     return G_SOURCE_REMOVE;
 }
@@ -941,23 +1019,15 @@ typedef struct { WebViewInstance *inst; guint keyval; int down; } KeyArgs;
 static gboolean idle_key(gpointer data)
 {
     KeyArgs *a = data;
-    if (a->inst->wpeView) {
-        /* Look up the hardware keycode via the shared display keymap. */
-        guint keycode = 0;
-        WPEKeymap *keymap = wpe_display_get_keymap(_display);
-        if (keymap) {
-            WPEKeymapEntry *entries = NULL;
-            guint n = 0;
-            if (wpe_keymap_get_entries_for_keyval(keymap, a->keyval, &entries, &n) && n > 0)
-                keycode = entries[0].keycode;
-            g_free(entries);
-        }
-        WPEEvent *ev = wpe_event_keyboard_new(
-            a->down ? WPE_EVENT_KEYBOARD_KEY_DOWN : WPE_EVENT_KEYBOARD_KEY_UP,
-            a->inst->wpeView, WPE_INPUT_SOURCE_KEYBOARD, _ms_now(),
-            0, keycode, a->keyval);
-        wpe_view_event(a->inst->wpeView, ev);
-        wpe_event_unref(ev);
+    if (a->inst->backend) {
+        struct wpe_input_keyboard_event ev = {
+            .time              = _ms_now(),
+            .key_code          = a->keyval,   /* XKB/GDK keysym */
+            .hardware_key_code = 0,
+            .pressed           = a->down ? true : false,
+            .modifiers         = 0,
+        };
+        wpe_view_backend_dispatch_keyboard_event(a->inst->backend, &ev);
     }
     free(a);
     return G_SOURCE_REMOVE;

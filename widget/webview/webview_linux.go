@@ -3,7 +3,12 @@
 package webview
 
 /*
-#cgo pkg-config: wpe-webkit-2.0 gbm
+// Default backend: the modern WPE Platform API with the headless platform.
+#cgo linux,!wpe_fdo pkg-config: wpe-webkit-2.0 gbm
+// Fallback backend (-tags wpe_fdo): the legacy libwpe + WPEBackend-FDO path,
+// for distributions (e.g. Debian) whose wpewebkit is built without the
+// headless WPE platform. See webview_linux_fdo.c.
+#cgo linux,wpe_fdo pkg-config: wpe-webkit-2.0 wpebackend-fdo-1.0 wpe-1.0 wayland-server
 #cgo LDFLAGS: -lglib-2.0 -lpthread
 
 #include "webview_linux.h"
