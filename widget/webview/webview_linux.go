@@ -4,11 +4,24 @@ package webview
 
 /*
 // Default backend: the modern WPE Platform API with the headless platform.
+// Only the wpe-webkit-2.0 API series carries the WPE Platform API, so the
+// headless backend always links against it.
 #cgo linux,!wpe_fdo pkg-config: wpe-webkit-2.0 gbm
+
 // Fallback backend (-tags wpe_fdo): the legacy libwpe + WPEBackend-FDO path,
-// for distributions (e.g. Debian) whose wpewebkit is built without the
-// headless WPE platform. See webview_linux_fdo.c.
-#cgo linux,wpe_fdo pkg-config: wpe-webkit-2.0 wpebackend-fdo-1.0 wpe-1.0 wayland-server
+// for distributions whose wpewebkit is built without the headless WPE
+// platform.  It uses only classic WebKit APIs, so it can link against either
+// WPE WebKit API series — pick the one the target distro packages:
+//
+//   -tags wpe_fdo               → wpe-webkit-2.0  (libwpewebkit-2.0-dev)
+//   -tags wpe_fdo,wpe_webkit11  → wpe-webkit-1.1  (libwpewebkit-1.1-dev)
+//
+// The two series are not source-compatible; WV_WPE_WEBKIT_1 tells the C code
+// which one it is being built against (see webview_linux_fdo.c).
+#cgo linux,wpe_fdo,!wpe_webkit11 pkg-config: wpe-webkit-2.0 wpebackend-fdo-1.0 wpe-1.0 wayland-server
+#cgo linux,wpe_fdo,wpe_webkit11  pkg-config: wpe-webkit-1.1 wpebackend-fdo-1.0 wpe-1.0 wayland-server
+#cgo linux,wpe_fdo,wpe_webkit11  CFLAGS: -DWV_WPE_WEBKIT_1=1
+
 #cgo LDFLAGS: -lglib-2.0 -lpthread
 
 #include "webview_linux.h"

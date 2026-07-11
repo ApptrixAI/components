@@ -429,8 +429,14 @@ static void apply_dark_js(WebViewInstance *inst)
     char *js = g_strdup_printf(
         "window.__wvApplyDark&&window.__wvApplyDark(%s)",
         inst->dark ? "true" : "false");
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
     webkit_web_view_evaluate_javascript(inst->webView, js, -1,
                                         NULL, NULL, NULL, NULL, NULL);
+#else
+    /* evaluate_javascript arrived in 2.40; older releases only have the
+       (now deprecated) run_javascript. */
+    webkit_web_view_run_javascript(inst->webView, js, NULL, NULL, NULL);
+#endif
     g_free(js);
 }
 
@@ -476,7 +482,13 @@ static int global_init(void)
     /* Poll every second so the pressure handler fires even without
        cgroup memory-pressure notifications from the OS. */
     webkit_memory_pressure_settings_set_poll_interval(mem, 1.0);
+#ifdef WV_WPE_WEBKIT_1
+    /* The 1.1 series has no WebKitNetworkSession; the process-wide
+       memory-pressure settings live on the website data manager instead. */
+    webkit_website_data_manager_set_memory_pressure_settings(mem);
+#else
     webkit_network_session_set_memory_pressure_settings(mem);
+#endif
     webkit_memory_pressure_settings_free(mem);
 
     /* Now it is safe to touch the web context / cache model. */
@@ -543,7 +555,13 @@ static WebViewInstance *instance_create(int width, int height, uintptr_t goHandl
     /* User content manager: carries the favicon-reading script and receives
        the decoded pixels the page posts back. */
     WebKitUserContentManager *ucm = webkit_user_content_manager_new();
+#ifdef WV_WPE_WEBKIT_1
+    /* The 1.1 series takes no script world argument here (it has a separate
+       _in_world variant); the 2.0 series merged them into one call. */
+    webkit_user_content_manager_register_script_message_handler(ucm, "favicon");
+#else
     webkit_user_content_manager_register_script_message_handler(ucm, "favicon", NULL);
+#endif
     g_signal_connect(ucm, "script-message-received::favicon",
         G_CALLBACK(on_favicon_message), inst);
     WebKitUserScript *script = webkit_user_script_new(
