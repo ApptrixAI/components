@@ -26,15 +26,15 @@ type Chat struct {
 	Source MessageSource `json:"-"`
 
 	// HideNames can be set to disable the display of sender names above chat messages.
-	HideNames bool
+	HideNames bool `json:",omitempty"`
 
 	// Selectable should be set to true if you want the messages to support text selection.
-	Selectable bool
+	Selectable bool `json:",omitempty"`
 
 	// TypeIncoming can be set to reveal messages that arrive from others one
 	// character at a time, as chat bots often do. Messages that we send, and
 	// those already present when the chat is first shown, always appear complete.
-	TypeIncoming bool
+	TypeIncoming bool `json:",omitempty"`
 
 	container *fyne.Container
 	follow    *fyne.Container
@@ -57,7 +57,7 @@ type MessageSource interface {
 	GetMessage(int) Message
 }
 
-// Creates a new chat widget, using the given source, and calling the onSend
+// New creates a new chat widget, using the given source, and calling the onSend
 // function with the text and time of the message to send.
 func New(source MessageSource, onSubmitted func(string)) *Chat {
 	c := &Chat{
