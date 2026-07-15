@@ -22,6 +22,9 @@ type messageItem struct {
 	obj       *fyne.Container
 	hideNames func() bool
 	mine      bool
+
+	// waiting is set while this message is queued behind another that is still being revealed.
+	waiting bool
 }
 
 func newMessageItem(c *Chat) *messageItem {
@@ -82,8 +85,21 @@ func (m *messageItem) applySide() {
 	m.container.Layout = layout.NewBorderLayout(m.top, nil, nil, m.spacer)
 }
 
-func (m *messageItem) setMessage(msg Message) {
+func (m *messageItem) setMessage(id widget.ListItemID, msg Message) {
 	m.text.Selectable = m.c.Selectable
+	m.mine = msg.IsMine()
+
+	text, ready := m.c.messageText(id, msg)
+	m.waiting = !ready
+	if !ready {
+		// an earlier message is still being setRevealed, so show nothing of this one
+		m.bg.Hide()
+		m.text.Hide()
+		m.obj.Hide()
+		m.Refresh()
+		return
+	}
+	m.bg.Show()
 	m.sender.SetText(msg.SenderName())
 
 	if omsg, ok := msg.(ObjectMessage); ok {
@@ -91,18 +107,26 @@ func (m *messageItem) setMessage(msg Message) {
 		m.obj.Show()
 		m.text.Hide()
 	} else {
-		m.text.SetText(msg.Text())
+		m.text.SetText(text)
 		m.text.Show()
 		m.obj.Hide()
 	}
 
-	m.mine = msg.IsMine()
 	m.applySide()
 	m.Refresh()
 }
 
+func (m *messageItem) MinSize() fyne.Size {
+	if m.waiting {
+		return fyne.Size{}
+	}
+
+	return m.BaseWidget.MinSize()
+}
+
 func (m *messageItem) Refresh() {
-	if fn := m.hideNames; fn != nil && fn() {
+	fn := m.hideNames
+	if m.waiting || (fn != nil && fn()) {
 		m.top.Hide()
 	} else {
 		m.top.Show()

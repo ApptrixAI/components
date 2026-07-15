@@ -31,12 +31,25 @@ type Chat struct {
 	// Selectable should be set to true if you want the messages to support text selection.
 	Selectable bool
 
+	// TypeIncoming can be set to reveal messages that arrive from others one
+	// character at a time, as chat bots often do. Messages that we send, and
+	// those already present when the chat is first shown, always appear complete.
+	TypeIncoming bool
+
 	container *fyne.Container
 	follow    *fyne.Container
 	list      *messageList
 	input     *input
 	submit    *widget.Button
 	maxId     int
+
+	// typer is the message currently being setRevealed, if any.
+	typer *typewriter
+	// shown is how far down the list we have setRevealed - messages before it are
+	// drawn complete, and are never typed out again as we scroll back to them.
+	shown            int
+	hasShown         bool
+	lastRevealedText string
 }
 
 type MessageSource interface {
@@ -79,7 +92,7 @@ func (c *Chat) setup() {
 
 		item := obj.(*messageItem)
 		item.hideNames = c.hideNames
-		item.setMessage(msg)
+		item.setMessage(id, msg)
 
 		c.list.SetItemHeight(id, item.MinSize().Height)
 
@@ -184,5 +197,21 @@ func (c *Chat) CreateRenderer() fyne.WidgetRenderer {
 	if c.container == nil {
 		c.setup()
 	}
+
+	// messages that were in the source before we were first shown are history -
+	// they did not arrive in front of the user, so they are not typed out
+	if !c.hasShown {
+		c.hasShown = true
+
+		if c.Source != nil {
+			c.shown = c.Source.Length()
+			if c.shown > 0 {
+				if last := c.Source.GetMessage(c.shown - 1); last != nil {
+					c.lastRevealedText = last.Text()
+				}
+			}
+		}
+	}
+
 	return widget.NewSimpleRenderer(c.container)
 }
