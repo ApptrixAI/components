@@ -33,12 +33,12 @@ func newBubble() *bubble {
 // tailDrop is how far the tail hangs below the body of the bubble.
 // Message content must be inset by this much so it does not sit over the tail.
 func tailDrop(w fyne.Widget) float32 {
-	return theme.SizeForWidget(theme.SizeNamePadding, w) * 2
+	return theme.SizeForWidget(theme.SizeNamePadding, w) * 1.5
 }
 
 // tailBase is how much of the bubble's bottom edge the tail flares out from.
 func tailBase(w fyne.Widget) float32 {
-	return theme.SizeForWidget(theme.SizeNamePadding, w) * 2.5
+	return theme.SizeForWidget(theme.SizeNamePadding, w) * 2
 }
 
 // points returns the bubble outline, clockwise from the top left, along with

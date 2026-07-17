@@ -38,7 +38,7 @@ func newMessageItem(c *Chat) *messageItem {
 	m.text.Selectable = c.Selectable
 
 	m.bg = newBubble()
-	m.bg.radius = m.text.MinSize().Height / 6
+	m.bg.radius = c.Theme().Size(theme.SizeNamePadding)
 
 	m.obj = container.NewPadded()
 	m.obj.Hide()
@@ -132,8 +132,7 @@ func (m *messageItem) Refresh() {
 		m.top.Show()
 	}
 
-	// the theme may have changed, so re-measure the bubble
-	m.bg.radius = m.text.MinSize().Height / 6
+	m.bg.radius = m.Theme().Size(theme.SizeNamePadding)
 	m.applySide()
 
 	m.bg.Refresh()
